@@ -71,3 +71,9 @@ rag/
 # LLM API keys
 *.key
 *.secret
+
+code/C2/volumes/*
+**/volumes/
+*.wal
+*.db
+*.sst

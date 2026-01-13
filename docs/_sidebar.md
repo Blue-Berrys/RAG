@@ -12,6 +12,7 @@
         - [第二节 多模态嵌入](chapter3/07_multimodal_embedding.md)
         - [第三节 向量数据库](chapter3/08_vector_db.md)
         - [第四节 Milvus实践](chapter3/09_milvus.md)
+        - [附：Milvus快速上手指南](chapter3/milvus_quick_start.md)
         - [第五节 索引优化](chapter3/10_index_optimization.md)
     - 第四章 检索优化
         - [第一节 混合检索](chapter4/11_hybrid_search.md)
