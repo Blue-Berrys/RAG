@@ -113,8 +113,9 @@
 
 | 组件 | 技术 | 说明 |
 |------|------|------|
-| Embedding | Zhipu AI `embedding-2` | 1024 维向量 |
-| LLM | Zhipu AI `glm-4-flash` | 完全免费 |
+| AI 框架 | [CloudWeGo Eino](https://github.com/cloudwego/eino) | 字节跳动开源的 LLM 应用开发框架 |
+| Embedding | Zhipu AI `embedding-2` | 1024 维向量，通过 eino OpenAI 兼容接口调用 |
+| LLM | Zhipu AI `glm-4-flash` | 完全免费，通过 eino OpenAI 兼容接口调用 |
 | 中文分词 | jieba-go | `github.com/yanyiwu/gojieba` |
 
 ### 数据库
@@ -136,8 +137,11 @@ github.com/milvus-io/milvus-sdk-go/v2 # Milvus 客户端
 github.com/redis/go-redis/v9          # Redis 客户端
 github.com/yanyiwu/gojieba            # jieba 分词
 
-# 智谱 AI
-github.com/zhipuai/zhipuai-ai-go-v3  # Zhipu AI SDK
+# AI 框架 (CloudWeGo Eino)
+github.com/cloudwego/eino                          # LLM 应用开发框架核心
+github.com/cloudwego/eino-ext                       # Eino 扩展组件
+github.com/cloudwego/eino-ext/components/model/openai      # OpenAI 兼容 ChatModel
+github.com/cloudwego/eino-ext/components/embedding/openai # OpenAI 兼容 Embedding
 ```
 
 ---
@@ -514,24 +518,29 @@ go run cmd/build-graph/main.go
 
 ### 6. LLM 生成 (`pkg/ml/llm/zhipu.go`)
 
-**职责**: 调用智谱 AI GLM-4-flash 模型生成答案。
+**职责**: 通过 eino 框架调用智谱 AI GLM-4-flash 模型生成答案。
 
-#### 流程
+#### 技术实现
+
+使用 **CloudWeGo Eino** 框架的 OpenAI 兼容接口：
 
 ```go
-func (z *ZhipuLLM) Generate(ctx context.Context, prompt string) (string, error) {
-    // 1. 构造请求
-    req := ChatCompletionRequest{
-        Model: z.config.Model,
-        Messages: []Message{
-            {Role: "user", Content: prompt},
-        },
-        Temperature: z.config.Temperature,
-        MaxTokens:   z.config.MaxTokens,
-    }
+// 1. 创建 ChatModel（通过 eino 框架）
+chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+    APIKey:     apiKey,
+    BaseURL:    "https://open.bigmodel.cn/api/paas/v4",  // 智谱 OpenAI 兼容接口
+    Model:      "glm-4-flash",
+    ByAzure:    false,
+})
 
-    // 2. 调用 API
-    resp, err := z.client.CreateChatCompletion(ctx, req)
+// 2. 构造 eino 标准消息格式
+messages := []*schema.Message{
+    schema.UserMessage(prompt),
+}
+
+// 3. 调用生成
+response, err := chatModel.Generate(ctx, messages)
+```
 
     // 3. 提取内容
     return resp.Content, nil
