@@ -253,7 +253,16 @@ func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter
 			} else {
 				rowCount := int64(0)
 				if count, ok := stats["row_count"]; ok {
-					rowCount = count.(int64)
+					// Milvus 返回的 row_count 可能是 string 或 int64，需要处理两种情况
+					switch v := count.(type) {
+					case int64:
+						rowCount = v
+					case string:
+						// 如果是字符串，转换为 int64
+						fmt.Sscanf(v, "%d", &rowCount)
+					case float64:
+						rowCount = int64(v)
+					}
 				}
 
 				if rowCount > 0 {
