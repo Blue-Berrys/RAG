@@ -102,16 +102,24 @@ func (r *BM25Retriever) Tokenize(text string) []string {
 }
 
 // isPunctuation 判断是否是标点符号
+// 只有整个字符串都是标点符号才返回true，只要有一个有效字符就保留
 func isPunctuation(s string) bool {
+	if len(s) == 0 {
+		return true
+	}
+
+	hasValidChar := false
 	for _, r := range s {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') {
-			// 中文字符范围检查
-			if r < 0x4e00 || r > 0x9fa5 {
-				return true
-			}
+		isAlpha := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		isChinese := r >= 0x4e00 && r <= 0x9fa5
+
+		if isAlpha || isDigit || isChinese {
+			hasValidChar = true
 		}
 	}
-	return false
+
+	return !hasValidChar // 没有任何有效字符才算标点
 }
 
 // IndexDocuments 索引文档

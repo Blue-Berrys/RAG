@@ -193,10 +193,9 @@ func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter
 
 	log.Infof("📚 Loaded %d documents", len(documents))
 
-	// BM25 在中文场景下效果较差，已禁用
-	// 如需启用，可以取消注释以下代码：
-	// bm25Retriever := retrieval.NewBM25Retriever(retrieval.DefaultBM25Config())
-	// bm25Retriever.IndexDocuments(ctx, documents)
+	// 使用BM25进行全文检索（补充向量检索的不足）
+	bm25Retriever := retrieval.NewBM25Retriever(retrieval.DefaultBM25Config())
+	bm25Retriever.IndexDocuments(ctx, documents)
 
 	// 使用向量检索器，索引到Milvus
 	if vectorRetriever != nil && embeddingProvider != nil && milvusClient != nil {

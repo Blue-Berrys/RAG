@@ -282,13 +282,14 @@ func (r *QueryRouter) recommendStrategy(analysis *models.QueryAnalysis) string {
 		return "graph"
 	}
 
-	// 优先级2：混合检索（如果查询复杂且启用）
-	if r.config.EnableHybrid && analysis.Complexity > r.config.ComplexityThreshold {
+	// 优先级2：混合检索（默认策略）
+	// 混合检索结合了向量检索的语义理解能力和BM25的关键词精确匹配
+	// RRF算法自动平衡两种检索结果，提供最佳的召回率和精确度
+	if r.config.EnableHybrid {
 		return "hybrid"
 	}
 
-	// 默认：向量检索（语义理解，效果最好）
-	// BM25 在中文场景下分词不匹配问题严重，已移除
+	// 默认：向量检索
 	return "vector"
 }
 
