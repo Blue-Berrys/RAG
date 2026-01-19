@@ -231,20 +231,49 @@ func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter
 				} else {
 					log.Infof("✅ Collection loaded: %s", collectionName)
 				}
+
+				// 新创建的集合，需要插入数据
+				if err := vectorRetriever.IndexDocuments(ctx, documents); err != nil {
+					log.Warnf("⚠️  Failed to index to Milvus: %v", err)
+				} else {
+					log.Infof("✅ Documents indexed to Milvus")
+				}
 			}
 		} else {
-			// 集合已存在，确保已加载
+			// 集合已存在，检查是否已有数据
+			stats, err := milvusClient.GetCollectionStats(ctx, collectionName)
+			if err != nil {
+				log.Warnf("⚠️  Failed to get collection stats: %v", err)
+				// 无法获取统计信息，尝试插入
+				if err := vectorRetriever.IndexDocuments(ctx, documents); err != nil {
+					log.Warnf("⚠️  Failed to index to Milvus: %v", err)
+				} else {
+					log.Infof("✅ Documents indexed to Milvus")
+				}
+			} else {
+				rowCount := int64(0)
+				if count, ok := stats["row_count"]; ok {
+					rowCount = count.(int64)
+				}
+
+				if rowCount > 0 {
+					// 已有数据，跳过插入
+					log.Infof("⏭️  Collection already has %d documents, skipping insertion", rowCount)
+				} else {
+					// 空集合，插入数据
+					log.Infof("📝 Collection is empty, inserting %d documents", len(documents))
+					if err := vectorRetriever.IndexDocuments(ctx, documents); err != nil {
+						log.Warnf("⚠️  Failed to index to Milvus: %v", err)
+					} else {
+						log.Infof("✅ Documents indexed to Milvus")
+					}
+				}
+			}
+
+			// 确保集合已加载
 			if err := milvusClient.LoadCollection(ctx, collectionName); err != nil {
 				log.Warnf("⚠️  Failed to load collection: %v", err)
 			}
-			log.Infof("✅ Collection already exists: %s", collectionName)
-		}
-
-		// 索引文档
-		if err := vectorRetriever.IndexDocuments(ctx, documents); err != nil {
-			log.Warnf("⚠️  Failed to index to Milvus: %v", err)
-		} else {
-			log.Infof("✅ Documents indexed to Milvus")
 		}
 	}
 
