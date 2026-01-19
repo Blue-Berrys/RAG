@@ -287,12 +287,13 @@ func (r *QueryRouter) recommendStrategy(analysis *models.QueryAnalysis) string {
 		return "hybrid"
 	}
 
-	// 优先级3：向量检索（中等复杂度查询，语义理解）
-	if analysis.Complexity > 0.1 {
+	// 优先级3：向量检索（语义理解，优先使用）
+	// 降低阈值，让更多查询使用向量检索，因为向量检索效果更好
+	if analysis.Complexity > 0.0 {
 		return "vector"
 	}
 
-	// 默认：BM25（简单关键词精确匹配，如"红烧肉"、"怎么做"）
+	// 默认：BM25（几乎不会用到，除非空查询）
 	return "bm25"
 }
 
