@@ -183,7 +183,7 @@ func (r *QueryRouter) calculateComplexity(query string) float64 {
 func (r *QueryRouter) detectRelationshipIntensity(query string) float64 {
 	intensity := 0.0
 
-	// 1. 关系词检测
+	// 1. 通用关系词检测
 	relationWords := []string{
 		"关联", "关系", "联系", "依赖", "相关", "连接",
 		"related", "relationship", "connection", "link", "associate",
@@ -194,7 +194,25 @@ func (r *QueryRouter) detectRelationshipIntensity(query string) float64 {
 		}
 	}
 
-	// 2. 多实体检测（简单的名词短语检测）
+	// 2. 菜谱场景关系词（新增）
+	recipeRelationWords := []string{
+		// 食材相关
+		"食材", "配料", "主料", "辅料", "代替", "替代", "替换",
+		"用...做", "用...可以", "还有什么", "类似",
+		// 分类相关
+		"菜系", "属于什么菜", "分类", "类型",
+		// 关联查询
+		"还能", "也可以", "其他的", "相关的",
+		// 组合查询
+		"和", "搭配", "一起", "含有", "包含",
+	}
+	for _, word := range recipeRelationWords {
+		if strings.Contains(query, word) {
+			intensity += 0.25
+		}
+	}
+
+	// 3. 多实体检测（简单的名词短语检测）
 	// 使用正确的中文Unicode范围
 	entityPattern := regexp.MustCompile(`[\x{4e00}-\x{9fa5}]{2,4}|[a-zA-Z]{3,}`)
 	entities := entityPattern.FindAllString(query, -1)
@@ -204,7 +222,7 @@ func (r *QueryRouter) detectRelationshipIntensity(query string) float64 {
 	}
 	intensity += entityScore * 0.5
 
-	// 3. 层级关系词
+	// 4. 层级关系词
 	hierarchyWords := []string{
 		"包含", "属于", "部分", "子类", "父类",
 		"contain", "include", "part of", "subclass", "parent",
@@ -213,6 +231,20 @@ func (r *QueryRouter) detectRelationshipIntensity(query string) float64 {
 		if strings.Contains(strings.ToLower(query), word) {
 			intensity += 0.2
 		}
+	}
+
+	// 5. 菜谱特定模式（新增）
+	// "用A可以做B" -> 图检索
+	if regexp.MustCompile(`用.+做.*菜`).MatchString(query) {
+		intensity += 0.4
+	}
+	// "A和B能做什么" -> 图检索
+	if regexp.MustCompile(`.+和.+能.*做`).MatchString(query) {
+		intensity += 0.4
+	}
+	// "和...类似的" -> 图检索
+	if strings.Contains(query, "类似") || strings.Contains(query, "相似") {
+		intensity += 0.3
 	}
 
 	if intensity > 1.0 {
@@ -255,12 +287,12 @@ func (r *QueryRouter) recommendStrategy(analysis *models.QueryAnalysis) string {
 		return "hybrid"
 	}
 
-	// 优先级3：向量检索（中等复杂度）
-	if analysis.Complexity > 0.3 {
+	// 优先级3：向量检索（中等复杂度查询，语义理解）
+	if analysis.Complexity > 0.1 {
 		return "vector"
 	}
 
-	// 默认：BM25（简单查询）
+	// 默认：BM25（简单关键词精确匹配，如"红烧肉"、"怎么做"）
 	return "bm25"
 }
 

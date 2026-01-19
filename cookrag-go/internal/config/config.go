@@ -25,12 +25,12 @@ type ServerConfig struct {
 }
 
 type EmbeddingConfig struct {
-	Provider   string `yaml:"provider"`
-	APIKey     string `yaml:"api_key"`
-	SecretKey  string `yaml:"secret_key"`
-	Model      string `yaml:"model"`
-	BaseURL    string `yaml:"base_url"`
-	Timeout    int    `yaml:"timeout"`
+	Provider   string `mapstructure:"provider"`
+	APIKey     string `mapstructure:"api_key"`
+	SecretKey  string `mapstructure:"secret_key"`
+	Model      string `mapstructure:"model"`
+	BaseURL    string `mapstructure:"base_url"`
+	Timeout    int    `mapstructure:"timeout"`
 }
 
 type MilvusConfig struct {

@@ -4,15 +4,12 @@ server:
   read_timeout: 30
   write_timeout: 30
 
-# Embedding配置（推荐智谱AI）
+# Embedding配置（智谱AI）
 embedding:
-  provider: "zhipu"  # zhipu, qianfan, dashscope, volcengine
+  provider: "zhipu"
   model: "embedding-2"
   api_key: "${ZHIPU_API_KEY}"
   timeout: 30
-
-  # 如果用百度千帆，需要提供secret_key
-  # secret_key: "${QIANFAN_SECRET_KEY}"
 
 # Milvus向量数据库
 milvus:

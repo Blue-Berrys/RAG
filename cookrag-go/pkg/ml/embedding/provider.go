@@ -19,12 +19,11 @@ type Provider interface {
 
 // Config Embedding配置
 type Config struct {
-	Provider  string `yaml:"provider"`   // zhipu, qianfan, dashscope, volcengine
-	APIKey    string `yaml:"api_key"`
-	SecretKey string `yaml:"secret_key"` // 百度需要
-	Model     string `yaml:"model"`
-	BaseURL   string `yaml:"base_url"`
-	Timeout   int    `yaml:"timeout"` // 超时时间（秒）
+	Provider  string `yaml:"provider" mapstructure:"provider"`   // zhipu
+	APIKey    string `yaml:"api_key" mapstructure:"api_key"`
+	Model     string `yaml:"model" mapstructure:"model"`
+	BaseURL   string `yaml:"base_url" mapstructure:"base_url"`
+	Timeout   int    `yaml:"timeout" mapstructure:"timeout"` // 超时时间（秒）
 }
 
 // NewProvider 创建Embedding Provider
@@ -36,13 +35,7 @@ func NewProvider(config Config) (Provider, error) {
 	switch config.Provider {
 	case "zhipu":
 		return NewZhipuEmbedding(config), nil
-	case "qianfan":
-		return NewQianfanEmbedding(config), nil
-	case "dashscope":
-		return NewDashscopeEmbedding(config), nil
-	case "volcengine":
-		return NewVolcengineEmbedding(config), nil
 	default:
-		return nil, fmt.Errorf("unknown embedding provider: %s, supported: zhipu, qianfan, dashscope, volcengine", config.Provider)
+		return nil, fmt.Errorf("unknown embedding provider: %s, only zhipu is supported", config.Provider)
 	}
 }

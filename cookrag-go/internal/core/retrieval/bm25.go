@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"cookrag-go/internal/models"
+	"github.com/yanyiwu/gojieba"
 )
 
 // BM25Config BM25配置参数
@@ -44,8 +45,9 @@ type InvertedIndex struct {
 
 // BM25Retriever BM25检索器
 type BM25Retriever struct {
-	config *BM25Config
-	index  *InvertedIndex
+	config    *BM25Config
+	index     *InvertedIndex
+	tokenizer *gojieba.Jieba
 }
 
 // NewBM25Retriever 创建BM25检索器
@@ -54,44 +56,62 @@ func NewBM25Retriever(config *BM25Config) *BM25Retriever {
 		config = DefaultBM25Config()
 	}
 
+	// 初始化 jieba 分词器
+	tokenizer := gojieba.NewJieba()
+
 	return &BM25Retriever{
-		config: config,
+		config:    config,
+		tokenizer: tokenizer,
 		index: &InvertedIndex{
-			Postings:    make(map[string][]int64),
-			DocFreq:     make(map[string]int),
-			DocLengths:  make(map[int64]int),
+			Postings:     make(map[string][]int64),
+			DocFreq:      make(map[string]int),
+			DocLengths:   make(map[int64]int),
 			AvgDocLength: 0,
-			TotalDocs:   0,
+			TotalDocs:    0,
 		},
 	}
 }
 
-// Tokenize 分词（简单实现，可替换为jieba等中文分词）
+// Tokenize 使用 jieba 进行中文分词
 func (r *BM25Retriever) Tokenize(text string) []string {
-	// 转小写
-	text = strings.ToLower(text)
-	// 简单分词（按空格和标点）
-	words := strings.FieldsFunc(text, func(c rune) bool {
-		return c == ' ' || c == '\t' || c == '\n' || c == '.' || c == ',' || c == '!' || c == '?'
-	})
+	// 使用 jieba 分词，搜索模式 (HMM=true)
+	words := r.tokenizer.Cut(text, true)
 
 	// 停用词过滤（简化版）
 	stopWords := map[string]bool{
 		"的": true, "了": true, "在": true, "是": true, "我": true,
 		"有": true, "和": true, "就": true, "不": true, "人": true,
+		"之": true, "与": true, "及": true, "等": true, "或": true,
+		"吗": true, "呢": true, "吧": true, "啊": true, "呀": true,
+		// 英文停用词
 		"the": true, "a": true, "an": true, "and": true, "or": true,
 		"but": true, "in": true, "on": true, "at": true, "to": true,
+		"of": true, "for": true, "with": true, "by": true, "from": true,
 	}
 
 	filtered := make([]string, 0)
 	for _, word := range words {
 		word = strings.TrimSpace(word)
-		if word != "" && !stopWords[word] && len(word) > 1 {
+		// 过滤停用词、单字符、纯数字/标点
+		if word != "" && !stopWords[word] && len(word) > 1 && !isPunctuation(word) {
 			filtered = append(filtered, word)
 		}
 	}
 
 	return filtered
+}
+
+// isPunctuation 判断是否是标点符号
+func isPunctuation(s string) bool {
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') {
+			// 中文字符范围检查
+			if r < 0x4e00 || r > 0x9fa5 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // IndexDocuments 索引文档

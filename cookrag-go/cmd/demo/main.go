@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -146,7 +147,7 @@ func main() {
 	go observability.Global.StartMetricsReporter(metricsCtx, 30*time.Second)
 
 	// 8. 演示完整的RAG流程（包含LLM生成）
-	demonstrateCompleteRAG(metricsCtx, queryRouter, llmProvider, vectorRetriever, embeddingProvider)
+	demonstrateCompleteRAG(metricsCtx, queryRouter, llmProvider, vectorRetriever, embeddingProvider, milvusClient)
 
 	// 9. 启动HTTP服务器
 	go func() {
@@ -179,50 +180,68 @@ func main() {
 }
 
 // demonstrateCompleteRAG 演示完整的RAG流程（包含LLM生成）
-func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter, llmProvider *llm.ZhipuLLM, vectorRetriever *retrieval.VectorRetriever, embeddingProvider embeddingCfg.Provider) {
+func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter, llmProvider *llm.ZhipuLLM, vectorRetriever *retrieval.VectorRetriever, embeddingProvider embeddingCfg.Provider, milvusClient *milvus.Client) {
 	log.Info("📚 Running Complete RAG Demonstration...")
 
-	// 准备示例文档
-	sampleDocuments := []models.Document{
-		{
-			ID:      "doc1",
-			Content: "红烧肉是一道经典的中国菜，主要食材是五花肉，用酱油、糖、料酒等调料炖煮而成。做法是先将五花肉切块焯水，然后用糖炒糖色，加入酱油、料酒、八角、桂皮等调料小火慢炖1-2小时，直到肉质软烂，肥而不腻。红烧肉富含蛋白质和脂肪，是中式料理的代表之一。",
-			Metadata: map[string]interface{}{
-				"category": "肉类",
-				"cuisine":  "中式",
-				"difficulty": "简单",
-			},
-		},
-		{
-			ID:      "doc2",
-			Content: "宫保鸡丁是四川传统名菜，属于川菜代表。主料是鸡胸肉和花生米，调料包括干辣椒、花椒、葱姜蒜、糖醋汁。制作要点是先将鸡胸肉切丁上浆，然后热油快炒，保持鸡肉嫩滑。特点是酸甜微辣，鸡肉嫩滑，花生酥脆，营养均衡。",
-			Metadata: map[string]interface{}{
-				"category": "肉类",
-				"cuisine":  "川菜",
-				"difficulty": "中等",
-			},
-		},
-		{
-			ID:      "doc3",
-			Content: "麻婆豆腐是川菜中的经典素食菜品，发明于清朝同治年间。主要食材是嫩豆腐和牛肉末，调料有豆瓣酱、花椒、辣椒面。特点是麻、辣、鲜、香、烫，口感丰富。制作关键是豆腐要先焯水去豆腥味，炒制时要小火慢炖让豆腐充分入味。",
-			Metadata: map[string]interface{}{
-				"category": "素食",
-				"cuisine":  "川菜",
-				"difficulty": "简单",
-			},
-		},
+	// 从 docs/dishes 目录加载所有菜谱文档
+	documents, err := loadDocumentsFromDir("docs/dishes")
+	if err != nil {
+		log.Warnf("⚠️  Failed to load documents: %v", err)
+		log.Infof("📝 Using sample documents instead...")
+		documents = getSampleDocuments()
 	}
 
+	log.Infof("📚 Loaded %d documents", len(documents))
+
 	// 索引到BM25
+	log.Infof("📝 Indexing %d documents with BM25...", len(documents))
 	bm25Retriever := retrieval.NewBM25Retriever(retrieval.DefaultBM25Config())
-	if err := bm25Retriever.IndexDocuments(ctx, sampleDocuments); err != nil {
+	if err := bm25Retriever.IndexDocuments(ctx, documents); err != nil {
 		log.Warnf("⚠️  Failed to index BM25: %v", err)
+	} else {
+		log.Infof("✅ BM25 indexing completed: %d docs", len(documents))
 	}
 
 	// 如果有向量检索器，索引到Milvus
-	if vectorRetriever != nil && embeddingProvider != nil {
-		log.Infof("📦 Indexing documents to Milvus for vector search...")
-		if err := vectorRetriever.IndexDocuments(ctx, sampleDocuments); err != nil {
+	if vectorRetriever != nil && embeddingProvider != nil && milvusClient != nil {
+		log.Infof("📦 Indexing %d documents to Milvus for vector search...", len(documents))
+
+		// 确保 Milvus 集合存在
+		collectionName := "cookrag_documents"
+		hasCollection, err := milvusClient.HasCollection(ctx, collectionName)
+		if err != nil {
+			log.Warnf("⚠️  Failed to check collection: %v", err)
+		} else if !hasCollection {
+			log.Infof("📦 Creating Milvus collection: %s", collectionName)
+			if err := milvusClient.CreateCollection(ctx, collectionName, embeddingProvider.Dimension()); err != nil {
+				log.Warnf("⚠️  Failed to create collection: %v", err)
+			} else {
+				log.Infof("✅ Collection created: %s", collectionName)
+
+				// 创建索引
+				if err := milvusClient.CreateIndex(ctx, collectionName, "vector", "IVF_FLAT", map[string]string{}); err != nil {
+					log.Warnf("⚠️  Failed to create index: %v", err)
+				} else {
+					log.Infof("✅ Index created on collection: %s", collectionName)
+				}
+
+				// 加载集合
+				if err := milvusClient.LoadCollection(ctx, collectionName); err != nil {
+					log.Warnf("⚠️  Failed to load collection: %v", err)
+				} else {
+					log.Infof("✅ Collection loaded: %s", collectionName)
+				}
+			}
+		} else {
+			// 集合已存在，确保已加载
+			if err := milvusClient.LoadCollection(ctx, collectionName); err != nil {
+				log.Warnf("⚠️  Failed to load collection: %v", err)
+			}
+			log.Infof("✅ Collection already exists: %s", collectionName)
+		}
+
+		// 索引文档
+		if err := vectorRetriever.IndexDocuments(ctx, documents); err != nil {
 			log.Warnf("⚠️  Failed to index to Milvus: %v", err)
 		} else {
 			log.Infof("✅ Documents indexed to Milvus")
@@ -234,6 +253,7 @@ func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter
 		"红烧肉怎么做？",
 		"川菜有哪些特色？",
 		"有什么好吃的素食菜？",
+		"西红柿豆腐汤羹怎么做？",
 	}
 
 	for _, query := range queries {
@@ -261,15 +281,14 @@ func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter
 		if len(result.Documents) > 0 {
 			log.Infof("\n📄 Retrieved Documents:")
 			for i, doc := range result.Documents {
-				if i >= 2 { // 只显示前2个
+				if i >= 3 { // 显示前3个
 					break
 				}
 				log.Infof("  [%d] Score: %.4f", i+1, doc.Score)
-				log.Infof("      Content: %.100s...", doc.Content)
+				log.Infof("      Content: %.150s...", doc.Content)
 			}
 		} else {
 			log.Warnf("  ⚠️  No documents found - using general knowledge for LLM")
-			// 创建一个虚拟的空结果，让LLM基于常识回答
 			result.Documents = []models.Document{
 				{
 					ID:      "general",
@@ -308,6 +327,101 @@ func demonstrateCompleteRAG(ctx context.Context, queryRouter *router.QueryRouter
 	}
 
 	log.Info("\n✅ Demonstration completed")
+}
+
+// loadDocumentsFromDir 从目录加载所有 Markdown 文档
+func loadDocumentsFromDir(dir string) ([]models.Document, error) {
+	var documents []models.Document
+
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// 跳过目录和非 markdown 文件
+		if info.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+
+		// 读取文件内容
+		content, err := os.ReadFile(path)
+		if err != nil {
+			log.Warnf("⚠️  Failed to read file %s: %v", path, err)
+			return nil
+		}
+
+		// 获取相对路径作为 ID
+		relPath, err := filepath.Rel(dir, path)
+		if err != nil {
+			relPath = path
+		}
+
+		// 提取类别（从父目录名）
+		category := "未分类"
+		if parts := strings.Split(relPath, string(filepath.Separator)); len(parts) > 1 {
+			category = parts[0]
+		}
+
+		// 提取菜名（从文件名）
+		dishName := strings.TrimSuffix(filepath.Base(path), ".md")
+
+		// 创建文档
+		doc := models.Document{
+			ID:      relPath,
+			Content: string(content),
+			Metadata: map[string]interface{}{
+				"file":     relPath,
+				"category": category,
+				"dish":     dishName,
+			},
+		}
+
+		documents = append(documents, doc)
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to walk directory: %w", err)
+	}
+
+	if len(documents) == 0 {
+		return nil, fmt.Errorf("no documents found in directory: %s", dir)
+	}
+
+	return documents, nil
+}
+
+// getSampleDocuments 获取示例文档（作为后备）
+func getSampleDocuments() []models.Document {
+	return []models.Document{
+		{
+			ID:      "doc1",
+			Content: "红烧肉是一道经典的中国菜，主要食材是五花肉，用酱油、糖、料酒等调料炖煮而成。做法是先将五花肉切块焯水，然后用糖炒糖色，加入酱油、料酒、八角、桂皮等调料小火慢炖1-2小时，直到肉质软烂，肥而不腻。红烧肉富含蛋白质和脂肪，是中式料理的代表之一。",
+			Metadata: map[string]interface{}{
+				"category": "肉类",
+				"cuisine":  "中式",
+				"difficulty": "简单",
+			},
+		},
+		{
+			ID:      "doc2",
+			Content: "宫保鸡丁是四川传统名菜，属于川菜代表。主料是鸡胸肉和花生米，调料包括干辣椒、花椒、葱姜蒜、糖醋汁。制作要点是先将鸡胸肉切丁上浆，然后热油快炒，保持鸡肉嫩滑。特点是酸甜微辣，鸡肉嫩滑，花生酥脆，营养均衡。",
+			Metadata: map[string]interface{}{
+				"category": "肉类",
+				"cuisine":  "川菜",
+				"difficulty": "中等",
+			},
+		},
+		{
+			ID:      "doc3",
+			Content: "麻婆豆腐是川菜中的经典素食菜品，发明于清朝同治年间。主要食材是嫩豆腐和牛肉末，调料有豆瓣酱、花椒、辣椒面。特点是麻、辣、鲜、香、烫，口感丰富。制作关键是豆腐要先焯水去豆腥味，炒制时要小火慢炖让豆腐充分入味。",
+			Metadata: map[string]interface{}{
+				"category": "素食",
+				"cuisine":  "川菜",
+				"difficulty": "简单",
+			},
+		},
+	}
 }
 
 // buildContext 从文档构建上下文

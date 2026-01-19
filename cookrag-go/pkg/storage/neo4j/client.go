@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"github.com/yanyiwu/gojieba"
 )
 
 // Client Neo4j客户端封装
@@ -95,18 +97,41 @@ func (c *Client) ExecuteQuery(ctx context.Context, cypher string, params map[str
 	return results, nil
 }
 
+// ExecuteWrite 执行写入Cypher查询
+func (c *Client) ExecuteWrite(ctx context.Context, cypher string, params map[string]interface{}) ([][]interface{}, error) {
+	session := c.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite, DatabaseName: c.database})
+	defer session.Close(ctx)
+
+	result, err := session.Run(ctx, cypher, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute write query: %w", err)
+	}
+
+	var results [][]interface{}
+	for result.Next(ctx) {
+		record := result.Record()
+		row := make([]interface{}, 0, len(record.Keys))
+		for _, key := range record.Keys {
+			row = append(row, record.AsMap()[key])
+		}
+		results = append(results, row)
+	}
+
+	return results, nil
+}
+
 // MultiHopSearch 多跳搜索
 func (c *Client) MultiHopSearch(ctx context.Context, entities []string, maxDepth int) (*Subgraph, error) {
 	log.Printf("🕸️  Performing multi-hop search (entities: %v, max_depth: %d)", entities, maxDepth)
 
 	cypher := `
-	MATCH path = (start:Recipe)-[*1..2]-(related)
+	MATCH path = (start)-[*1..2]-(related)
 	WHERE start.name IN $entities
 	RETURN
-		start.nodeId AS start_id,
+		elementId(start) AS start_id,
 		start.name AS start_name,
 		labels(start) AS start_labels,
-		related.nodeId AS related_id,
+		elementId(related) AS related_id,
 		related.name AS related_name,
 		labels(related) AS related_labels,
 		type(last(relationships(path))) AS relation_type,
@@ -131,10 +156,10 @@ func (c *Client) MultiHopSearch(ctx context.Context, entities []string, maxDepth
 		if len(row) >= 7 {
 			startID := fmt.Sprintf("%v", row[0])
 			startName := fmt.Sprintf("%v", row[1])
-			startLabels := row[2].([]string)
+			startLabels := toStringSlice(row[2])
 			relatedID := fmt.Sprintf("%v", row[3])
 			relatedName := fmt.Sprintf("%v", row[4])
-			relatedLabels := row[5].([]string)
+			relatedLabels := toStringSlice(row[5])
 			relationType := fmt.Sprintf("%v", row[6])
 			_ = row[7] // hops field (unused)
 
@@ -165,19 +190,56 @@ func (c *Client) MultiHopSearch(ctx context.Context, entities []string, maxDepth
 	return subgraph, nil
 }
 
-// ExtractEntities 提取实体（简单实现）
+// ExtractEntities 提取实体（从查询中提取食材或菜品）
 func (c *Client) ExtractEntities(ctx context.Context, query string) ([]string, error) {
 	log.Printf("🔤 Extracting entities from query: %s", query)
 
+	// 使用jieba分词
+	jieba := gojieba.NewJieba()
+	defer jieba.Free()
+	words := jieba.CutForSearch(query, true)
+
+	// 停用词
+	stopWords := map[string]bool{
+		"的": true, "了": true, "是": true, "在": true, "我": true,
+		"能": true, "做": true, "哪些": true, "有": true, "和": true,
+		"怎么": true, "什么": true, "可以": true,
+	}
+
+	// 过滤出可能是实体名的词（2-4个字符的中文词）
+	queryParts := make([]string, 0)
+	for _, word := range words {
+		word = strings.TrimSpace(word)
+		// 过滤停用词和短词
+		if len([]rune(word)) >= 2 && len([]rune(word)) <= 4 && !stopWords[word] {
+			queryParts = append(queryParts, word)
+		}
+	}
+
+	if len(queryParts) == 0 {
+		queryParts = []string{query}
+	}
+
+	log.Printf("   Tokenized query parts: %v", queryParts)
+
+	// 查找食材和菜品节点
 	cypher := `
-	MATCH (entity:Recipe)
-	WHERE entity.name CONTAINS $query
-	RETURN entity.name AS name
-	LIMIT 10
+	MATCH (entity:Ingredient)
+	WHERE entity.name IN $queryParts
+	RETURN DISTINCT entity.name AS name, 'Ingredient' AS type
+	UNION
+	MATCH (entity:Dish)
+	WHERE entity.name IN $queryParts
+	RETURN DISTINCT entity.name AS name, 'Dish' AS type
+	UNION
+	MATCH (entity:Ingredient)
+	WHERE any(part IN $queryParts WHERE entity.name CONTAINS part)
+	RETURN DISTINCT entity.name AS name, 'Ingredient' AS type
+	LIMIT 20
 	`
 
 	results, err := c.ExecuteQuery(ctx, cypher, map[string]interface{}{
-		"query": query,
+		"queryParts": queryParts,
 	})
 	if err != nil {
 		return nil, err
@@ -187,6 +249,8 @@ func (c *Client) ExtractEntities(ctx context.Context, query string) ([]string, e
 	for _, row := range results {
 		if len(row) > 0 {
 			name := fmt.Sprintf("%v", row[0])
+			entityType := fmt.Sprintf("%v", row[1])
+			log.Printf("   Found: %s (%s)", name, entityType)
 			entities = append(entities, name)
 		}
 	}
@@ -243,4 +307,92 @@ func (c *Client) CommunityDetection(ctx context.Context, nodes []*GraphNode) (ma
 
 	log.Printf("✅ Community detection completed: %d communities", len(communities))
 	return communities, nil
+}
+
+// CreateNode 创建节点
+func (c *Client) CreateNode(ctx context.Context, label, name string, properties map[string]interface{}) (string, error) {
+	cypher := fmt.Sprintf(`
+		MERGE (n:%s {name: $name})
+		SET n += $props
+		RETURN elementId(n) as id
+	`, label)
+
+	// 合并 name 到 properties
+	if properties == nil {
+		properties = make(map[string]interface{})
+	}
+	properties["name"] = name
+
+	results, err := c.ExecuteWrite(ctx, cypher, map[string]interface{}{
+		"name":  name,
+		"props": properties,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create node: %w", err)
+	}
+
+	if len(results) > 0 && len(results[0]) > 0 {
+		return fmt.Sprintf("%v", results[0][0]), nil
+	}
+
+	return "", fmt.Errorf("no node created")
+}
+
+// CreateRelation 创建关系
+func (c *Client) CreateRelation(ctx context.Context, fromID, toID, relType string, properties map[string]interface{}) error {
+	cypher := fmt.Sprintf(`
+		MATCH (from), (to)
+		WHERE elementId(from) = $fromId AND elementId(to) = $toId
+		MERGE (from)-[r:%s]->(to)
+		SET r += $props
+		RETURN r
+	`, relType)
+
+	params := map[string]interface{}{
+		"fromId": fromID,
+		"toId":   toID,
+		"props":  properties,
+	}
+
+	_, err := c.ExecuteWrite(ctx, cypher, params)
+	if err != nil {
+		return fmt.Errorf("failed to create relation: %w", err)
+	}
+
+	return nil
+}
+
+// ClearGraph 清空图谱
+func (c *Client) ClearGraph(ctx context.Context) error {
+	cypher := "MATCH (n) DETACH DELETE n"
+	_, err := c.ExecuteWrite(ctx, cypher, nil)
+	if err != nil {
+		return fmt.Errorf("failed to clear graph: %w", err)
+	}
+	log.Printf("✅ Graph cleared")
+	return nil
+}
+
+// toStringSlice 将interface{}转换为[]string
+func toStringSlice(v interface{}) []string {
+	if v == nil {
+		return []string{}
+	}
+
+	switch val := v.(type) {
+	case []string:
+		return val
+	case []interface{}:
+		result := make([]string, 0, len(val))
+		for _, item := range val {
+			if str, ok := item.(string); ok {
+				result = append(result, str)
+			} else {
+				result = append(result, fmt.Sprintf("%v", item))
+			}
+		}
+		return result
+	default:
+		return []string{fmt.Sprintf("%v", v)}
+	}
 }

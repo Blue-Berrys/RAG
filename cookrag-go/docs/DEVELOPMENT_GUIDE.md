@@ -1,0 +1,894 @@
+# CookRAG-Go 开发文档
+
+## 目录
+
+1. [项目概述](#项目概述)
+2. [系统架构](#系统架构)
+3. [技术栈](#技术栈)
+4. [目录结构](#目录结构)
+5. [核心模块详解](#核心模块详解)
+6. [数据流程](#数据流程)
+7. [配置说明](#配置说明)
+8. [开发指南](#开发指南)
+9. [部署说明](#部署说明)
+10. [API 接口](#api-接口)
+
+---
+
+## 项目概述
+
+**CookRAG-Go** 是一个企业级的多模态检索增强生成（RAG）系统，专门为菜谱知识问答设计。
+
+### 核心特性
+
+| 特性 | 描述 |
+|------|------|
+| **多模态检索** | 向量搜索 + BM25 全文 + 知识图谱导航 |
+| **智能路由** | 根据查询复杂度自动选择最优检索策略 |
+| **知识图谱** | 342 份菜谱 → 537 个食材实体 + 341 个菜品实体 + 3449 条关系 |
+| **中文优化** | jieba 分词、停用词过滤、标点符号处理 |
+| **LLM 生成** | 智谱 AI GLM-4-flash 模型（免费） |
+
+### 测试结果
+
+```
+📊 系统性能指标：
+- 平均检索延迟: ~100ms
+- 错误率: 0%
+- 成功率: 100% (4/4 查询)
+- 图谱规模: 341 菜品 + 537 食材 + 3449 关系
+```
+
+---
+
+## 系统架构
+
+### 整体架构图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      用户查询 (Query)                         │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  智能查询路由 (Router)  │
+              └──────────┬───────────┘
+                         │
+         ┌───────────────┼───────────────┐
+         │               │               │
+         ▼               ▼               ▼
+    ┌─────────┐    ┌─────────┐    ┌─────────┐
+    │  向量   │    │  BM25   │    │   图谱   │
+    │ 检索    │    │  检索   │    │  检索   │
+    └────┬────┘    └────┬────┘    └────┬────┘
+         │              │              │
+         └──────────────┼──────────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │   上下文构建 (Context) │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │   LLM 答案生成         │
+              │   (Zhipu GLM-4)      │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │      最终答案           │
+              └──────────────────────┘
+```
+
+### 模块职责
+
+| 模块 | 职责 | 文件位置 |
+|------|------|----------|
+| **配置管理** | 加载 YAML 配置，环境变量替换 | `internal/config/` |
+| **查询路由** | 分析查询，选择检索策略 | `internal/core/router/` |
+| **向量检索** | Milvus 语义搜索 | `internal/core/retrieval/vector.go` |
+| **BM25 检索** | 倒排索引全文搜索 | `internal/core/retrieval/bm25.go` |
+| **图检索** | Neo4j 多跳关系查询 | `internal/core/retrieval/graph.go` |
+| **混合检索** | RRF 算法融合多种结果 | `internal/core/retrieval/hybrid.go` |
+| **知识图谱** | 实体提取、图谱构建 | `internal/kg/` |
+| **LLM 生成** | 智谱 AI 对话生成 | `pkg/ml/llm/` |
+| **Embedding** | 文本向量化 | `pkg/ml/embedding/` |
+| **存储层** | Milvus/Neo4j/Redis | `pkg/storage/` |
+
+---
+
+## 技术栈
+
+### 后端框架
+
+| 组件 | 技术 | 版本 |
+|------|------|------|
+| 语言 | Go | 1.21+ |
+| Web 框架 | 标准库 `net/http` | - |
+| 配置管理 | Viper | - |
+
+### AI/ML
+
+| 组件 | 技术 | 说明 |
+|------|------|------|
+| Embedding | Zhipu AI `embedding-2` | 1024 维向量 |
+| LLM | Zhipu AI `glm-4-flash` | 完全免费 |
+| 中文分词 | jieba-go | `github.com/yanyiwu/gojieba` |
+
+### 数据库
+
+| 数据库 | 用途 | 连接方式 |
+|--------|------|----------|
+| **Milvus** | 向量数据库 | `localhost:19530` |
+| **Neo4j** | 图数据库 | `bolt://localhost:7687` |
+| **Redis** | 缓存 | `localhost:6379` |
+
+### 依赖库
+
+```bash
+# 核心依赖
+github.com/charmbracelet/log           # 日志
+github.com/spf13/viper                # 配置管理
+github.com/neo4j/neo4j-go-driver/v5  # Neo4j 客户端
+github.com/milvus-io/milvus-sdk-go/v2 # Milvus 客户端
+github.com/redis/go-redis/v9          # Redis 客户端
+github.com/yanyiwu/gojieba            # jieba 分词
+
+# 智谱 AI
+github.com/zhipuai/zhipuai-ai-go-v3  # Zhipu AI SDK
+```
+
+---
+
+## 目录结构
+
+```
+cookrag-go/
+├── cmd/                          # 命令行工具
+│   ├── demo/                     # 主演示程序
+│   │   └── main.go               # 完整 RAG 流程演示
+│   ├── build-graph/              # 知识图谱构建工具
+│   │   └── main.go
+│   ├── test-graph/               # 图检索测试工具
+│   │   └── main.go
+│   └── server/                   # HTTP API 服务器
+│       └── main.go
+│
+├── internal/                     # 内部包（不对外暴露）
+│   ├── api/                      # HTTP API
+│   │   ├── server/               # 服务器实现
+│   │   │   └── server.go
+│   │   └── handlers/             # 请求处理器
+│   │       └── query.go
+│   ├── config/                   # 配置管理
+│   │   └── config.go             # 配置加载和解析
+│   ├── core/                     # 核心业务逻辑
+│   │   ├── retrieval/            # 检索模块
+│   │   │   ├── vector.go        # 向量检索
+│   │   │   ├── bm25.go          # BM25 全文检索
+│   │   │   ├── graph.go         # 知识图谱检索
+│   │   │   └── hybrid.go        # 混合检索
+│   │   └── router/               # 智能查询路由
+│   │       └── router.go         # 路由逻辑
+│   ├── kg/                       # 知识图谱
+│   │   ├── extractor.go          # 实体提取器
+│   │   └── builder.go            # 图谱构建器
+│   ├── models/                   # 数据模型
+│   │   └── document.go           # 文档、检索结果模型
+│   └── observability/            # 可观测性
+│       ├── metrics.go            # Prometheus 指标
+│       └── tracing.go           # 链路追踪
+│
+├── pkg/                          # 公共库（可对外使用）
+│   ├── ml/                       # 机器学习模块
+│   │   ├── embedding/            # Embedding 服务
+│   │   │   ├── provider.go       # 提供者接口
+│   │   │   └── zhipu.go          # 智谱 AI 实现
+│   │   └── llm/                  # LLM 服务
+│   │       ├── provider.go       # 提供者接口
+│   │       └── zhipu.go          # 智谱 AI 实现
+│   ├── storage/                  # 存储客户端
+│   │   ├── cache/                # Redis 缓存
+│   │   │   └── redis.go
+│   │   ├── milvus/               # Milvus 向量数据库
+│   │   │   └── client.go
+│   │   └── neo4j/                # Neo4j 图数据库
+│   │       └── client.go         # 包含 CreateNode, CreateRelation 等
+│   └── monitoring/               # 监控
+│       └── metrics.go            # Prometheus 指标收集
+│
+├── config/                       # 配置文件
+│   └── config.yaml               # 主配置文件
+│
+├── docs/dishes/                 # 菜谱数据（342 份 Markdown 文件）
+│   ├── meat_dish/                # 肉菜
+│   ├── vegetable_dish/           # 素菜
+│   ├── soup/                     # 汤羹
+│   ├── aquatic/                  # 水产
+│   └── ...
+│
+├── deployments/                 # 部署配置
+│   └── docker/                   # Docker Compose
+│       └── docker-compose.yml
+│
+├── .env.example                  # 环境变量示例
+├── go.mod                        # Go 模块依赖
+├── go.sum                        # 依赖校验和
+├── Makefile                      # 构建脚本
+├── run.sh                        # 快速启动脚本
+└── README.md                     # 项目说明
+```
+
+---
+
+## 核心模块详解
+
+### 1. 智能查询路由 (`router.go`)
+
+**职责**: 根据查询的复杂度和关系强度，自动选择最优的检索策略。
+
+#### 路由决策流程
+
+```
+查询输入
+    │
+    ▼
+┌─────────────────┐
+│ 1. 计算复杂度    │ → 查询长度、关键词数、特殊字符
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 2. 检测关系强度  │ → 关系词、实体数量、层级关系
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 3. 计算置信度    │ → 基于复杂度和关系强度
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 4. 推荐策略      │
+│                 │
+│ if 关系强度 > 0.6:        │
+│     → 图检索 (Graph)      │
+│ elif 复杂度 > 0.1:        │
+│     → 向量检索 (Vector)    │
+│ else:                     │
+│     → BM25 检索            │
+└──────────────────────────┘
+```
+
+#### 关键函数
+
+```go
+// Route 智能路由主函数
+func (r *QueryRouter) Route(ctx context.Context, query string) (*models.RetrievalResult, error)
+
+// detectRelationshipIntensity 检测关系强度
+// 返回值 0-1，越高表示越需要图检索
+func (r *QueryRouter) detectRelationshipIntensity(query string) float64
+
+// calculateComplexity 计算查询复杂度
+// 返回值 0-1，越高表示查询越复杂
+func (r *QueryRouter) calculateComplexity(query string) float64
+```
+
+#### 菜谱场景特定规则
+
+```go
+// 菜谱关系词（新增）
+recipeRelationWords := []string{
+    "食材", "配料", "主料", "辅料", "代替", "替代", "替换",
+    "用...做", "还有什么", "类似",
+    "菜系", "属于什么菜", "分类", "类型",
+    "还能", "也可以", "其他的", "相关的",
+    "和", "搭配", "一起", "含有", "包含",
+}
+
+// 菜谱特定模式
+if regexp.MustCompile(`用.+做.*菜`).MatchString(query) {
+    intensity += 0.4  // "用A做B" → 图检索
+}
+if regexp.MustCompile(`.+和.+能.*做`).MatchString(query) {
+    intensity += 0.4  // "A和B能做什么" → 图检索
+}
+```
+
+### 2. 向量检索 (`vector.go`)
+
+**职责**: 使用 Milvus 进行语义相似度搜索。
+
+#### 工作流程
+
+```
+查询文本
+    │
+    ▼
+┌─────────────────┐
+│ Embedding 向量化  │ → 调用 Zhipu embedding-2 API
+└────────┬────────┘
+         │
+         ▼ 1024 维向量
+┌─────────────────┐
+│ Milvus 相似度搜索│ → IVF_FLAT 索引，L2 距离
+└────────┬────────┘
+         │
+         ▼ Top-K 结果
+┌─────────────────┐
+│  Redis 缓存检查  │ → 相同查询直接返回
+└────────┬────────┘
+         │
+         ▼
+    返回文档列表
+```
+
+#### 关键代码
+
+```go
+type VectorRetriever struct {
+    config           *VectorRetrieverConfig
+    embeddingProvider embedding.Provider
+    milvusClient     *milvus.Client
+    redisClient      *cache.Client
+}
+
+// Retrieve 执行向量检索
+func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.RetrievalResult, error)
+```
+
+### 3. BM25 全文检索 (`bm25.go`)
+
+**职责**: 基于倒排索引的关键词匹配搜索。
+
+#### BM25 算法
+
+```
+Score(D, Q) = Σ IDF(qi) × (f(qi, D) × (k1 + 1)) / (f(qi, D) + k1 × (1 - b + b × |D| / avgdl))
+
+其中:
+- f(qi, D): 词项 qi 在文档 D 中的频率
+- |D|: 文档 D 的长度
+- avgdl: 平均文档长度
+- k1: 词频饱和参数 (默认 1.5)
+- b: 长度惩罚参数 (默认 0.75)
+- IDF(qi): 逆文档频率
+```
+
+#### 中文分词集成
+
+```go
+type BM25Retriever struct {
+    config    *BM25Config
+    index     *InvertedIndex
+    tokenizer *gojieba.Jieba  // jieba 分词器
+}
+
+// Tokenize 使用 jieba 进行中文分词
+func (r *BM25Retriever) Tokenize(text string) []string {
+    words := r.tokenizer.Cut(text, true)  // HMM=true 搜索模式
+
+    // 停用词过滤
+    stopWords := map[string]bool{
+        "的": true, "了": true, "在": true, "是": true,
+        "之": true, "与": true, "及": true, "等": true,
+        // ...
+    }
+
+    filtered := make([]string, 0)
+    for _, word := range words {
+        if !stopWords[word] && len(word) > 1 && !isPunctuation(word) {
+            filtered = append(filtered, word)
+        }
+    }
+    return filtered
+}
+```
+
+### 4. 知识图谱检索 (`graph.go`)
+
+**职责**: 基于 Neo4j 的多跳关系查询。
+
+#### 图谱模式
+
+```
+(菜品Dish) ──[包含]──> (食材Ingredient)
+    │
+    ├──[属于]──> (分类Category)
+    ├──[菜系]──> (菜系Cuisine)
+    ├──[难度]──> (难度Difficulty)
+    └──[使用]──> (工具Tool)
+```
+
+#### 多跳查询
+
+```go
+// MultiHopSearch 多跳搜索
+// entities: 提取的实体列表（食材、菜品名）
+// maxDepth: 最大跳数（默认 2）
+func (c *Client) MultiHopSearch(ctx context.Context, entities []string, maxDepth int) (*Subgraph, error)
+
+// Cypher 查询示例
+MATCH path = (start)-[*1..2]-(related)
+WHERE start.name IN $entities
+RETURN elementId(start), start.name, labels(start),
+       elementId(related), related.name, labels(related),
+       type(last(relationships(path))) AS relation_type
+```
+
+#### 实体提取
+
+```go
+// 使用 jieba 分词 + Neo4j 查询
+func (c *Client) ExtractEntities(ctx context.Context, query string) ([]string, error) {
+    jieba := gojieba.NewJieba()
+    defer jieba.Free()
+    words := jieba.CutForSearch(query, true)
+
+    // 过滤停用词，提取候选实体
+    queryParts := filterStopWords(words)
+
+    // 在 Neo4j 中查找匹配的节点
+    cypher := `
+        MATCH (entity:Ingredient) WHERE entity.name IN $queryParts
+        RETURN DISTINCT entity.name
+    `
+}
+```
+
+### 5. 知识图谱构建 (`internal/kg/`)
+
+#### 实体提取器 (`extractor.go`)
+
+**功能**: 从 Markdown 菜谱中自动提取实体和关系。
+
+```go
+// ExtractFromRecipe 从菜谱提取实体和关系
+func (e *RecipeExtractor) ExtractFromRecipe(content, category, dishName string) *ExtractedData
+
+// 提取的实体类型
+type EntityType string
+const (
+    EntityDish        EntityType = "Dish"        // 菜品
+    EntityIngredient  EntityType = "Ingredient"  // 食材
+    EntityCategory    EntityType = "Category"    // 分类
+    EntityCuisine     EntityType = "Cuisine"     // 菜系
+    EntityDifficulty  EntityType = "Difficulty"  // 难度
+    EntityTool        EntityType = "Tool"        // 工具
+)
+
+// 提取的关系类型
+type RelationType string
+const (
+    RelationContains    RelationType = "包含"     // Dish -> Ingredient
+    RelationBelongsTo   RelationType = "属于"     // Dish -> Category
+    RelationCuisine     RelationType = "菜系"     // Dish -> Cuisine
+    RelationDifficulty  RelationType = "难度"     // Dish -> Difficulty
+    RelationUsesTool    RelationType = "使用"     // Dish -> Tool
+)
+```
+
+#### 图谱构建器 (`builder.go`)
+
+**功能**: 将提取的实体和关系导入 Neo4j。
+
+```go
+// BuildFromDocuments 从文档构建知识图谱
+func (b *GraphBuilder) BuildFromDocuments(ctx context.Context, documents []Document) (*BuildStats, error)
+
+// 构建统计
+type BuildStats struct {
+    TotalDishes      int    // 菜品数量
+    TotalIngredients  int    // 食材数量
+    TotalCategories   int    // 分类数量
+    TotalRelations    int    // 关系数量
+    BuildDuration     time.Duration
+}
+```
+
+#### 使用方式
+
+```bash
+# 构建知识图谱
+go run cmd/build-graph/main.go
+```
+
+**输出**:
+```
+🕸️  CookRAG Knowledge Graph Builder
+✅ Loaded 342 documents
+🕸️  Starting knowledge graph construction...
+🔨 Creating 911 unique entities...
+🔗 Creating 3449 relations...
+✅ Knowledge graph built successfully!
+
+📊 Stats:
+   Dishes:      341
+   Ingredients: 537
+   Categories:  11
+   Relations:   3449
+```
+
+### 6. LLM 生成 (`pkg/ml/llm/zhipu.go`)
+
+**职责**: 调用智谱 AI GLM-4-flash 模型生成答案。
+
+#### 流程
+
+```go
+func (z *ZhipuLLM) Generate(ctx context.Context, prompt string) (string, error) {
+    // 1. 构造请求
+    req := ChatCompletionRequest{
+        Model: z.config.Model,
+        Messages: []Message{
+            {Role: "user", Content: prompt},
+        },
+        Temperature: z.config.Temperature,
+        MaxTokens:   z.config.MaxTokens,
+    }
+
+    // 2. 调用 API
+    resp, err := z.client.CreateChatCompletion(ctx, req)
+
+    // 3. 提取内容
+    return resp.Content, nil
+}
+```
+
+---
+
+## 数据流程
+
+### 完整的 RAG 流程
+
+```
+用户查询: "红烧肉怎么做？"
+    │
+    ├─> [查询路由] 分析: complexity=0.10, entities=0.2, strategy=vector
+    │
+    ├─> [向量检索]
+    │   ├─> Embedding: "红烧肉怎么做？" → [0.23, -0.45, ..., 0.67] (1024维)
+    │   ├─> Milvus 搜索: top_k=10, metric=L2
+    │   └─> 返回 2 个相关文档
+    │
+    ├─> [上下文构建]
+    │   └─> 格式化检索结果为 LLM prompt
+    │
+    ├─> [LLM 生成]
+    │   ├─> 模型: glm-4-flash
+    │   ├─> 输入: prompt + 检索上下文
+    │   └─> 输出: 详细菜谱步骤
+    │
+    └─> [返回答案]
+        └─> "红烧肉的做法如下：..."
+```
+
+### 知识图谱检索流程
+
+```
+用户查询: "用鸡蛋能做哪些菜？"
+    │
+    ├─> [查询路由] 分析: complexity=0.11, entities=0.6, strategy=graph
+    │
+    ├─> [实体提取]
+    │   ├─> jieba 分词: ["用", "鸡蛋", "能", "做", "哪些", "菜"]
+    │   ├─> 停用词过滤: ["鸡蛋"]
+    │   └─> Neo4j 匹配: 找到 8 个相关实体
+    │
+    ├─> [多跳搜索]
+    │   ├─> Cypher: MATCH (鸡蛋)-[*1..2]-(related)
+    │   ├─> 结果: 200 nodes, 100 relations
+    │   └─> 返回相关菜品节点
+    │
+    └─> [返回结果]
+        └─> 返回 10 个包含鸡蛋的菜品
+```
+
+---
+
+## 配置说明
+
+### 环境变量
+
+创建 `.env` 文件：
+
+```bash
+# 复制示例配置
+cp .env.example .env
+
+# 编辑 .env，填入你的 API 密钥
+export ZHIPU_API_KEY="your_api_key_here"
+
+# Neo4j 配置
+export NEO4J_USERNAME="neo4j"
+export NEO4J_PASSWORD="your_password"
+
+# Redis 配置（如果没有密码，留空）
+export REDIS_PASSWORD=""
+```
+
+### 配置文件 (`config/config.yaml`)
+
+```yaml
+# Embedding配置
+embedding:
+  provider: "zhipu"
+  model: "embedding-2"
+  api_key: "${ZHIPU_API_KEY}"
+  timeout: 30
+
+# Milvus向量数据库
+milvus:
+  host: "localhost"
+  port: "19530"
+  dimension: 1024
+  index_type: "IVF_FLAT"
+  metric_type: "L2"
+
+# Neo4j图数据库
+neo4j:
+  uri: "bolt://localhost:7687"
+  database: "neo4j"
+
+# Redis缓存
+redis:
+  host: "localhost"
+  port: "6379"
+
+# LLM配置
+llm:
+  provider: "zhipu"
+  model: "glm-4"
+  api_key: "${ZHIPU_API_KEY}"
+  temperature: 0.1
+  max_tokens: 2048
+```
+
+---
+
+## 开发指南
+
+### 快速开始
+
+```bash
+# 1. 克隆项目
+git clone <repo_url>
+cd cookrag-go
+
+# 2. 安装依赖
+go mod tidy
+
+# 3. 配置环境变量
+cp .env.example .env
+# 编辑 .env 文件
+
+# 4. 启动依赖服务
+cd deployments/docker
+docker-compose up -d
+
+# 5. 运行演示
+bash run.sh
+```
+
+### 构建知识图谱
+
+```bash
+go run cmd/build-graph/main.go
+```
+
+### 运行测试
+
+```bash
+# 测试向量检索
+go run cmd/demo/main.go
+
+# 测试图检索
+go run cmd/test-graph/main.go
+```
+
+### 添加新的检索策略
+
+1. 在 `internal/core/retrieval/` 创建新文件
+2. 实现 `Retrieve` 方法
+
+```go
+package retrieval
+
+type MyRetriever struct {
+    config *MyConfig
+}
+
+func (r *MyRetriever) Retrieve(ctx context.Context, query string) (*models.RetrievalResult, error) {
+    // 实现检索逻辑
+    return &models.RetrievalResult{
+        Documents: docs,
+        Strategy:  "my_strategy",
+        Query:     query,
+    }, nil
+}
+```
+
+3. 在 `router.go` 中添加路由规则
+
+---
+
+## 部署说明
+
+### Docker 部署
+
+```bash
+cd deployments/docker
+docker-compose up -d
+```
+
+**服务清单**:
+- Milvus: 向量数据库
+- Neo4j: 图数据库
+- Redis: 缓存
+- Etcd: Milvus 配置存储
+- Minio: Milvus 对象存储
+
+### 启动 API 服务
+
+```bash
+go run cmd/server/main.go
+```
+
+API 默认运行在 `http://localhost:8080`
+
+---
+
+## API 接口
+
+### POST /api/query
+
+查询接口，返回检索结果和 LLM 生成的答案。
+
+**请求**:
+```json
+{
+  "query": "红烧肉怎么做？",
+  "top_k": 10,
+  "use_llm": true
+}
+```
+
+**响应**:
+```json
+{
+  "strategy": "vector",
+  "documents": [
+    {
+      "id": "doc_123",
+      "content": "# 湖南家常红烧肉的做法...",
+      "score": 0.8523,
+      "metadata": {
+        "file": "meat_dish/红烧肉.md",
+        "category": "meat_dish",
+        "dish": "红烧肉"
+      }
+    }
+  ],
+  "answer": "红烧肉的做法如下：...",
+  "latency": 72
+}
+```
+
+### GET /api/health
+
+健康检查接口。
+
+**响应**:
+```json
+{
+  "status": "healthy",
+  "components": {
+    "milvus": "connected",
+    "neo4j": "connected",
+    "redis": "connected",
+    "llm": "connected"
+  }
+}
+```
+
+---
+
+## 常见问题
+
+### Q: 如何切换 Embedding 提供商？
+
+修改 `config/config.yaml`:
+
+```yaml
+embedding:
+  provider: "zhipu"  # 目前只支持 zhipu
+```
+
+### Q: 如何调整 BM25 参数？
+
+在 `internal/core/retrieval/bm25.go`:
+
+```go
+config := &BM25Config{
+    K1: 1.5,  // 词频饱和参数
+    B:  0.75, // 长度惩罚参数
+}
+```
+
+### Q: 知识图谱数据在哪里？
+
+图谱数据存储在 Neo4j 中，使用 `cmd/build-graph` 构建：
+
+```bash
+go run cmd/build-graph/main.go
+```
+
+数据来源：`docs/dishes/` 目录下的 342 份 Markdown 文件。
+
+### Q: 如何添加新菜谱？
+
+1. 在 `docs/dishes/` 对应的分类目录下创建 `.md` 文件
+2. 遵循现有文件格式：
+   ```markdown
+   # 菜名
+
+   简介
+
+   预估烹饪难度：★★★
+
+   ## 必备原料和工具
+   - 食材1
+   - 食材2
+
+   ## 计算
+   - 食材1 100 g
+
+   ## 操作
+   1. 步骤1
+   2. 步骤2
+   ```
+3. 重新运行 demo 或构建图谱
+
+---
+
+## 性能优化建议
+
+### 1. 向量检索优化
+
+```go
+// 调整 Milvus 搜索参数
+searchParams := entity.NewIndexIvfFlatSearchParam(10)  // nlist 参数
+```
+
+### 2. Redis 缓存
+
+```go
+// 相同查询直接返回缓存
+if cached, found := r.redisClient.Get(ctx, cacheKey); found {
+    return cached, nil
+}
+```
+
+### 3. 批量 Embedding
+
+```go
+// 批量处理提高效率
+embeddings, err := r.embeddingProvider.EmbedBatch(ctx, texts)
+```
+
+---
+
+## 总结
+
+CookRAG-Go 是一个功能完整的企业级 RAG 系统，具有以下优势：
+
+1. **多模态检索**: 结合向量、BM25、图谱三种检索方式
+2. **智能路由**: 自动选择最优检索策略
+3. **中文优化**: jieba 分词、停用词过滤
+4. **可扩展性**: 模块化设计，易于添加新功能
+5. **生产就绪**: 完善的错误处理、日志、监控
+
+适用于需要复杂检索和知识关联的场景，如菜谱推荐、技术文档问答、产品知识库等。

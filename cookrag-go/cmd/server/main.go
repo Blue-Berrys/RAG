@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"cookrag-go/internal/config"
 	"cookrag-go/pkg/ml/embedding"
@@ -29,7 +30,14 @@ func main() {
 
 	// 2. 初始化Embedding Provider
 	log.Printf("🔤 Initializing embedding provider: %s", cfg.Embedding.Provider)
-	embeddingProvider, err := embedding.NewProvider(cfg.Embedding)
+	embeddingConfig := embedding.Config{
+		Provider: cfg.Embedding.Provider,
+		APIKey:   cfg.Embedding.APIKey,
+		Model:    cfg.Embedding.Model,
+		BaseURL:  cfg.Embedding.BaseURL,
+		Timeout:  cfg.Embedding.Timeout,
+	}
+	embeddingProvider, err := embedding.NewProvider(embeddingConfig)
 	if err != nil {
 		log.Fatalf("❌ Failed to create embedding provider: %v", err)
 	}
@@ -65,15 +73,15 @@ func main() {
 	}
 
 	// 5. 显示配置信息
-	fmt.Println("\n" + "="*60)
+	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("🎉 CookRAG-Go Initialization Successful!")
-	fmt.Println("="*60)
+	fmt.Println(strings.Repeat("=", 60))
 	fmt.Printf("Embedding Provider: %s (Model: %s)\n", cfg.Embedding.Provider, cfg.Embedding.Model)
 	fmt.Printf("Vector Dimension:  %d\n", embeddingProvider.Dimension())
 	fmt.Printf("Milvus:            %s:%s\n", cfg.Milvus.Host, cfg.Milvus.Port)
 	fmt.Printf("Neo4j:             %s\n", cfg.Neo4j.URI)
 	fmt.Printf("Redis:             %s:%s\n", cfg.Redis.Host, cfg.Redis.Port)
-	fmt.Println("="*60)
+	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println("\n📝 Next steps:")
 	fmt.Println("1. Start Milvus: docker-compose up -d milvus etcd minio")
 	fmt.Println("2. Start Neo4j: docker-compose up -d neo4j")
