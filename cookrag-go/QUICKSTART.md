@@ -48,7 +48,16 @@ go run cmd/demo/main.go
 ✅ Connected to Neo4j: bolt://localhost:7687
 ✅ Redis client connected
 ✅ LLM provider initialized
+✅ BM25 indexing completed: 342 docs, avg_len: 254.47, 8633 unique terms
 ```
+
+系统会自动运行演示查询，你应该看到：
+```
+🔀 Routing to Hybrid Retrieval
+✅ Hybrid retrieval completed: 10 results
+```
+
+这表示混合检索（向量+BM25）正在工作！
 
 ## 如果看到警告
 

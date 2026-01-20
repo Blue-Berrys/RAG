@@ -20,18 +20,24 @@
        │
 ┌──────▼──────────────────┐
 │  Query Router (智能路由)  │  自动分析查询，选择最优策略
-└──┬───┬───┬───┬──────────┘
-   │   │   │   │
-   │   │   │   └──────► Graph RAG (图检索)
-   │   │   └───────────► Hybrid (混合检索+RRF)
-   │   └───────────────► Vector (向量检索)
-   └───────────────────► BM25 (全文检索)
+└──┬───┬──────────────────┘
+   │   │
+   │   └──────────► Hybrid Retrieval (默认，混合检索+RRF)
+   │                   ├──► Vector (语义理解)
+   │                   └──► BM25 (关键词匹配)
+   │
+   └───────────────► Graph RAG (关系强度>0.6时)
    │
    ├──► Milvus (向量DB)
    ├──► Neo4j (图DB)
    ├──► Redis (缓存)
    └──► LLM (生成)
 ```
+
+**核心特性：**
+- **默认混合检索**：结合向量语义理解和BM25关键词精确匹配
+- **智能路由**：关系查询自动切换到图检索
+- **RRF融合**：自动平衡不同检索源的结果
 
 ## 📦 项目结构
 
@@ -150,23 +156,35 @@ go run cmd/demo/main.go
 ✅ Redis client connected
 ✅ LLM provider initialized
 
-📚 Running retrieval demonstrations...
+📚 Running Complete RAG Demonstration...
+📚 Loaded 342 documents
+📝 Indexing 342 documents with BM25
+✅ BM25 indexing completed: 342 docs, avg_len: 254.47, 8633 unique terms
+⏭️  Collection already has 4104 documents, skipping insertion
 
+======================================================================
 🔍 Query: 红烧肉怎么做？
-✅ Result:
-  Strategy: hybrid
-  Documents: 2
-  Latency: 125ms
-  [1] Score: 0.8532, Content: 红烧肉是一道经典的中国菜...
-  [2] Score: 0.7231, Content: 宫保鸡丁是四川传统名菜...
+======================================================================
+🚦 Routing query: 红烧肉怎么做？
+📊 Query analysis: complexity=0.10, strategy=hybrid
+🔀 Routing to Hybrid Retrieval
+🧠 Adaptive weights: vector=0.30, bm25=0.70
+✅ Hybrid retrieval completed: 10 results in 212.00ms
+
+🤖 Generating AI Answer...
+✅ AI Answer Generated (LLM Latency: 21397ms)
+📝 Answer:
+红烧肉是一道色香味俱全的经典中式菜肴，以下是详细的制作步骤：
+...
 
 ✅ Demonstration completed
-
 🚀 Starting HTTP server on port 8080
 📊 Metrics Summary:
-  Total Queries: 3
-  Average Latency: 120ms
-  Cache Hit Rate: 85.00%
+  Total Queries: 4
+  Average Latency: 125ms
+  Error Rate: 0.00%
+  Strategy Distribution:
+    Hybrid: 4 (100%)
 ```
 
 ### 5. 测试HTTP API
@@ -186,32 +204,57 @@ curl http://localhost:8080/api/v1/metrics
 
 ## 📊 检索策略对比
 
-| 策略 | 适用场景 | 优势 | 实现方法 |
+| 策略 | 适用场景 | 优势 | 权重配置 |
 |------|----------|------|----------|
-| **BM25** | 关键词查询、精确匹配 | 快速、准确 | 倒排索引 + TF-IDF |
-| **Vector** | 语义查询、相似度匹配 | 理解语义、泛化能力强 | Embedding + Milvus |
-| **Graph** | 关系查询、多跳推理 | 发现隐式关系 | Neo4j + 图遍历 |
-| **Hybrid** | 复杂查询、综合检索 | 兼顾语义和关键词 | RRF融合算法 |
+| **Hybrid（默认）** | **所有查询** | **语义理解 + 关键词精确匹配** | 向量70% + BM25 30%（可自适应调整） |
+| **Vector** | 语义查询、相似度匹配 | 理解语义、泛化能力强 | 作为Hybrid一部分 |
+| **BM25** | 关键词查询、精确匹配 | 快速、准确，擅长专有名词和ID | 作为Hybrid一部分 |
+| **Graph** | 关系查询、多跳推理 | 发现隐式关系 | 关系强度 > 0.6时触发 |
 
-### 智能路由示例
+### RRF融合算法
+
+混合检索使用RRF（Reciprocal Rank Fusion）算法自动融合向量检索和BM25检索结果：
+
+```
+混合得分 = 向量权重 × (K / (K + 向量排名)) + BM25权重 × (K / (K + BM25排名))
+```
+
+其中：
+- K = 60（RRF常数）
+- 默认权重：向量70%，BM25 30%
+- 自适应权重：根据查询复杂度动态调整（简单查询增加BM25权重）
+
+### 智能路由策略
+
+**默认策略：混合检索（Hybrid）**
+
+混合检索结合了向量检索的语义理解能力和BM25的关键词精确匹配，通过RRF（Reciprocal Rank Fusion）算法自动融合结果，是现代RAG系统的最佳实践。
+
+**路由优先级：**
+1. **图检索（Graph RAG）** - 当检测到强关系时（关系强度 > 0.6）
+2. **混合检索（Hybrid）** - 默认策略，适用于大多数查询
+3. **向量检索（Vector）** - 作为混合检索的一部分
 
 ```go
-// 简单查询 → BM25
-query := "红烧肉"
-// 路由到：BM25（关键词匹配）
-
-// 中等查询 → Vector
-query := "怎么做红烧肉？"
-// 路由到：Vector（语义理解）
-
-// 关系查询 → Graph
+// 关系查询 → Graph RAG
 query := "川菜和湘菜有什么关系？"
-// 路由到：Graph（关系推理）
+// 路由到：Graph（关系强度 > 0.6）
 
-// 复杂查询 → Hybrid
-query := "请推荐一些辣的川菜，不要太油腻的"
+// 大多数查询 → Hybrid（默认）
+query := "红烧肉怎么做？"
+// 路由到：Hybrid（向量语义 + BM25关键词）
+
+query := "川菜有哪些特色？"
+// 路由到：Hybrid（RRF融合）
+
+query := "有什么好吃的素食菜？"
 // 路由到：Hybrid（RRF融合）
 ```
+
+**混合检索优势：**
+- ✅ **向量检索**：理解语义，能找到相关但不完全相同的内容
+- ✅ **BM25检索**：精确关键词匹配，擅长专有名词、ID号
+- ✅ **RRF融合**：自动平衡两种检索结果，提供最佳召回率和精确度
 
 ## 🔧 配置说明
 
@@ -284,10 +327,17 @@ router:
 ## 🎯 面试亮点
 
 ### 技术深度
-1. **多种检索算法** - BM25、向量检索、图遍历、RRF融合
-2. **智能路由** - 基于查询复杂度的自适应策略选择
-3. **性能优化** - 缓存、批处理、并发、连接池
-4. **监控体系** - Prometheus指标、链路追踪、错误追踪
+1. **混合检索架构** - 采用业界领先的向量+BM25混合检索，RRF算法融合结果
+2. **多种检索算法** - BM25、向量检索、图遍历、RRF融合
+3. **智能路由** - 基于查询复杂度和关系强度的自适应策略选择
+4. **性能优化** - 缓存、批处理、并发、连接池
+5. **监控体系** - Prometheus指标、链路追踪、错误追踪
+
+### 架构设计亮点
+1. **现代RAG最佳实践** - 混合检索符合GraphRAG、Elasticsearch、Milvus等顶尖系统标准
+2. **向量检索优势** - 语义理解能力强，能找到相关但不完全相同的内容
+3. **BM25优势** - 精确关键词匹配，擅长专有名词、产品ID、罕见词
+4. **RRF融合算法** - 自动平衡不同检索源，提供最佳召回率和精确度
 
 ### 工程实践
 1. **接口设计** - 清晰的抽象接口、工厂模式、策略模式
