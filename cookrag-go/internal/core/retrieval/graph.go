@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/charmbracelet/log"
 	"cookrag-go/internal/models"
+	"cookrag-go/internal/observability"
 	"cookrag-go/pkg/storage/neo4j"
+
+	"github.com/charmbracelet/log"
 )
 
 // GraphRetrieverConfig 图RAG检索配置
 type GraphRetrieverConfig struct {
-	MaxDepth      int    // 最大跳数
-	MaxNodes      int    // 最大节点数
-	UseCommunity  bool   // 是否使用社区检测
-	TopK          int    // 返回结果数量
+	MaxDepth     int  // 最大跳数
+	MaxNodes     int  // 最大节点数
+	UseCommunity bool // 是否使用社区检测
+	TopK         int  // 返回结果数量
 }
 
 // DefaultGraphRetrieverConfig 默认配置
@@ -30,7 +32,7 @@ func DefaultGraphRetrieverConfig() *GraphRetrieverConfig {
 
 // GraphRetriever 图RAG检索器
 type GraphRetriever struct {
-	config     *GraphRetrieverConfig
+	config      *GraphRetrieverConfig
 	neo4jClient *neo4j.Client
 }
 
@@ -44,25 +46,34 @@ func NewGraphRetriever(
 	}
 
 	return &GraphRetriever{
-		config:     config,
+		config:      config,
 		neo4jClient: neo4jClient,
 	}
 }
 
 // Retrieve 图RAG检索
 func (r *GraphRetriever) Retrieve(ctx context.Context, query string) (*models.RetrievalResult, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "graph_retrieve", map[string]interface{}{
+		"query": query,
+		"max_depth": r.config.MaxDepth,
+	})
+	defer span.End()
+
 	startTime := time.Now()
 
 	log.Infof("🕸️  Graph RAG retrieval: query='%s', max_depth=%d", query, r.config.MaxDepth)
 
-	// 1. 提取查询中的实体
+	// 1. 提取查询中的实体,例如菜品、食材具体名称
 	entities, err := r.neo4jClient.ExtractEntities(ctx, query)
 	if err != nil {
+		span.SetError(err)
 		return nil, fmt.Errorf("failed to extract entities: %w", err)
 	}
 
 	if len(entities) == 0 {
 		log.Warnf("⚠️  No entities found in query: %s", query)
+		span.AddMetadata("entity_count", 0)
 		return &models.RetrievalResult{
 			Documents: []models.Document{},
 			Strategy:  "graph",
@@ -72,15 +83,19 @@ func (r *GraphRetriever) Retrieve(ctx context.Context, query string) (*models.Re
 	}
 
 	log.Infof("🔤 Extracted entities: %v", entities)
+	span.AddMetadata("entity_count", len(entities))
 
 	// 2. 多跳搜索获取子图
 	subgraph, err := r.neo4jClient.MultiHopSearch(ctx, entities, r.config.MaxDepth)
 	if err != nil {
+		span.SetError(err)
 		return nil, fmt.Errorf("multi-hop search failed: %w", err)
 	}
 
 	log.Infof("✅ Subgraph retrieved: %d nodes, %d relations",
 		len(subgraph.Nodes), len(subgraph.Relations))
+	span.AddMetadata("node_count", len(subgraph.Nodes))
+	span.AddMetadata("relation_count", len(subgraph.Relations))
 
 	// 3. 社区检测（可选）
 	var communities map[string][]*neo4j.GraphNode
@@ -108,6 +123,8 @@ func (r *GraphRetriever) Retrieve(ctx context.Context, query string) (*models.Re
 		Latency:   float64(time.Since(startTime).Milliseconds()),
 	}
 
+	span.AddMetadata("result_count", len(documents))
+	span.AddMetadata("latency_ms", result.Latency)
 	log.Infof("✅ Graph RAG retrieval completed: %d results in %.2fms",
 		len(documents), result.Latency)
 
@@ -115,19 +132,20 @@ func (r *GraphRetriever) Retrieve(ctx context.Context, query string) (*models.Re
 }
 
 // buildDocumentsFromSubgraph 从子图构建文档
+// Document 是统一的检索结果格式，用于：1)传给LLM作为上下文 2)返回给HTTP客户端 3)支持RRF融合排序
 func (r *GraphRetriever) buildDocumentsFromSubgraph(
 	subgraph *neo4j.Subgraph,
 	communities map[string][]*neo4j.GraphNode,
 ) []models.Document {
 	documents := make([]models.Document, 0)
 
-	// 为每个节点创建文档
+	// 为每个节点创建文档（节点 → Document）
 	for _, node := range subgraph.Nodes {
 		doc := models.Document{
 			ID:    node.NodeID,
 			Score: 1.0, // 默认分数
 			Content: fmt.Sprintf("节点: %s\n标签: %v",
-				node.Name, node.Labels),
+				node.Name, node.Labels), // Content 会传给 LLM 阅读的文本
 			Metadata: map[string]interface{}{
 				"node_id": node.NodeID,
 				"name":    node.Name,
@@ -136,12 +154,12 @@ func (r *GraphRetriever) buildDocumentsFromSubgraph(
 			},
 		}
 
-		// 添加属性
+		// 添加节点属性到元数据
 		for key, value := range node.Properties {
 			doc.Metadata[key] = value
 		}
 
-		// 添加社区信息
+		// 添加社区信息（节点所属的分组）
 		if communities != nil {
 			for communityLabel, communityNodes := range communities {
 				for _, communityNode := range communityNodes {
@@ -156,7 +174,7 @@ func (r *GraphRetriever) buildDocumentsFromSubgraph(
 		documents = append(documents, doc)
 	}
 
-	// 为每个关系创建文档
+	// 为每个关系创建文档（关系 → Document）
 	for _, relation := range subgraph.Relations {
 		doc := models.Document{
 			ID:    fmt.Sprintf("rel_%s_%s", relation.StartNodeID, relation.EndNodeID),
@@ -164,14 +182,14 @@ func (r *GraphRetriever) buildDocumentsFromSubgraph(
 			Content: fmt.Sprintf("关系: %s -> %s\n类型: %s",
 				relation.StartNodeID, relation.EndNodeID, relation.RelationType),
 			Metadata: map[string]interface{}{
-				"start_node_id":  relation.StartNodeID,
-				"end_node_id":    relation.EndNodeID,
-				"relation_type":  relation.RelationType,
-				"type":           "graph_relation",
+				"start_node_id": relation.StartNodeID,
+				"end_node_id":   relation.EndNodeID,
+				"relation_type": relation.RelationType,
+				"type":          "graph_relation",
 			},
 		}
 
-		// 添加关系属性
+		// 添加关系属性到元数据
 		for key, value := range relation.Properties {
 			doc.Metadata[key] = value
 		}
@@ -179,12 +197,12 @@ func (r *GraphRetriever) buildDocumentsFromSubgraph(
 		documents = append(documents, doc)
 	}
 
-	// 计算分数：基于节点度数（连接数）
+	// 计算分数：基于节点度数（连接数越多越重要）
 	nodeDegrees := r.calculateNodeDegrees(subgraph)
 	for i := range documents {
 		if nodeID, ok := documents[i].Metadata["node_id"].(string); ok {
 			if degree, exists := nodeDegrees[nodeID]; exists {
-				// 归一化分数
+				// 归一化分数（连接数 / 总节点数）
 				documents[i].Score = float32(degree) / float32(len(subgraph.Nodes))
 			}
 		}

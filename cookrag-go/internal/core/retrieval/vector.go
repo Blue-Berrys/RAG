@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"cookrag-go/internal/models"
+	"cookrag-go/internal/observability"
 	"cookrag-go/pkg/ml/embedding"
 	"cookrag-go/pkg/storage/cache"
 	"cookrag-go/pkg/storage/milvus"
@@ -65,29 +66,54 @@ func NewVectorRetriever(
 
 // Retrieve 向量检索
 func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.RetrievalResult, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "vector_retrieve", map[string]interface{}{
+		"query": query,
+		"top_k": r.config.TopK,
+	})
+	defer span.End()
+
 	startTime := time.Now()
 
-	// 1. 生成查询向量
+	// 1. 生成查询向量（创建子 span）
 	log.Infof("🔤 Embedding query: %s", query)
+	embeddingSpan := observability.GlobalTracer.StartSpan(ctx, "embedding_api", map[string]interface{}{
+		"query": query,
+	})
+	embeddingStart := time.Now()
 	queryEmbedding, err := r.embeddingProvider.Embed(ctx, query)
+	embeddingSpan.AddMetadata("duration_ms", float64(time.Since(embeddingStart).Milliseconds()))
 	if err != nil {
+		embeddingSpan.SetError(err)
+		embeddingSpan.End()
+		span.SetError(err)
 		return nil, fmt.Errorf("failed to embed query: %w", err)
 	}
+	embeddingSpan.End()
 
 	// 2. 检查缓存
 	if r.config.UseCache && r.cache != nil {
 		cacheKey := r.getCacheKey(query)
 		var cachedResult models.RetrievalResult
+		cacheCheckStart := time.Now()
 		if err := r.cache.Get(ctx, cacheKey, &cachedResult); err == nil {
+			cacheHit := true
+			span.AddMetadata("cache_hit", cacheHit)
+			span.AddMetadata("cache_latency_ms", float64(time.Since(cacheCheckStart).Milliseconds()))
 			log.Infof("💨 Cache hit for query: %s", query)
 			cachedResult.Latency = float64(time.Since(startTime).Milliseconds())
 			return &cachedResult, nil
 		}
+		span.AddMetadata("cache_hit", false)
 	}
 
-	// 3. 执行向量搜索
+	// 3. 执行向量搜索（创建子 span）
 	log.Infof("🔍 Searching in Milvus collection: %s", r.config.CollectionName)
-
+	searchSpan := observability.GlobalTracer.StartSpan(ctx, "milvus_search", map[string]interface{}{
+		"collection": r.config.CollectionName,
+		"top_k": r.config.TopK,
+	})
+	searchStart := time.Now()
 	searchResults, err := r.milvusClient.Search(
 		ctx,
 		r.config.CollectionName,
@@ -96,10 +122,14 @@ func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.R
 		[]string{r.config.TextField, r.config.MetadataField},
 		r.config.TopK,
 	)
-
+	searchSpan.AddMetadata("duration_ms", float64(time.Since(searchStart).Milliseconds()))
 	if err != nil {
+		searchSpan.SetError(err)
+		searchSpan.End()
+		span.SetError(err)
 		return nil, fmt.Errorf("milvus search failed: %w", err)
 	}
+	searchSpan.End()
 
 	// 4. 转换结果
 	documents := make([]models.Document, 0, len(searchResults))
@@ -136,6 +166,8 @@ func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.R
 		}
 	}
 
+	span.AddMetadata("result_count", len(documents))
+	span.AddMetadata("latency_ms", result.Latency)
 	log.Infof("✅ Vector retrieval completed: %d results in %.2fms",
 		len(documents), result.Latency)
 

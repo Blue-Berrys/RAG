@@ -7,11 +7,12 @@
 3. [技术栈](#技术栈)
 4. [目录结构](#目录结构)
 5. [核心模块详解](#核心模块详解)
-6. [数据流程](#数据流程)
-7. [配置说明](#配置说明)
-8. [开发指南](#开发指南)
-9. [部署说明](#部署说明)
-10. [API 接口](#api-接口)
+6. [可观测性](#可观测性)
+7. [数据流程](#数据流程)
+8. [配置说明](#配置说明)
+9. [开发指南](#开发指南)
+10. [部署说明](#部署说明)
+11. [API 接口](#api-接口)
 
 ---
 
@@ -515,6 +516,37 @@ type BuildStats struct {
 }
 ```
 
+#### Neo4j 索引优化
+
+在构建图谱前，系统会自动创建索引以加速查询：
+
+```go
+// createIndexes 创建索引
+// Neo4j 索引用途：加速节点属性查询（类似 MySQL 索引）
+// 例如：MATCH (n:Dish {name: '红烧肉'}) 会直接通过索引定位，而不是扫描所有节点
+func (b *GraphBuilder) createIndexes(ctx context.Context)
+```
+
+**创建的索引**：
+
+| 标签 | 属性 | 用途 |
+|------|------|------|
+| `Dish` | `name` | 加速按菜名查询 |
+| `Ingredient` | `name` | 加速按食材查询 |
+| `Category` | `name` | 加速按分类查询 |
+| `Cuisine` | `name` | 加速按菜系查询 |
+| `Difficulty` | `name` | 加速按难度查询 |
+
+**Neo4j 索引语法**：
+```cypher
+-- Neo4j 5.x 语法（系统使用的）
+CREATE INDEX IF NOT EXISTS FOR (n:Dish) ON (n.name)
+
+-- 查询性能对比
+-- 无索引：扫描所有节点（全节点扫描）O(N)
+-- 有索引：直接定位到目标节点 O(log N)
+```
+
 #### 使用方式
 
 ```bash
@@ -568,6 +600,100 @@ response, err := chatModel.Generate(ctx, messages)
     return resp.Content, nil
 }
 ```
+
+### 7. 可观测性 (`internal/observability/`)
+
+#### 7.1 链路追踪 (`tracing.go`)
+
+**职责**: 对整个 RAG 流程进行分布式链路追踪，记录每个操作的耗时和元数据。
+
+**作用**:
+- **性能分析**: 追踪每个操作的耗时，定位性能瓶颈
+- **错误定位**: 快速定位是哪个检索器或 LLM 调用失败
+- **调用链理解**: 查看完整的请求链路：路由 → 检索 → LLM 生成
+- **参数调试**: 记录查询参数、权重配置、结果数量等
+
+**已集成的模块**:
+
+| 模块 | Span 名称 | 追踪的元数据 |
+|------|-----------|--------------|
+| **QueryRouter** | `query_route` | complexity, relationship_intensity, recommended_strategy, result_count, latency_ms |
+| **VectorRetriever** | `vector_retrieve` + 子 span | top_k, cache_hit, result_count, latency_ms |
+| | `embedding_api` (子 span) | duration_ms |
+| | `milvus_search` (子 span) | duration_ms |
+| **BM25Retriever** | `bm25_retrieve` | query, top_k, term_count, result_count, latency_ms |
+| **GraphRetriever** | `graph_retrieve` | query, max_depth, entity_count, node_count, relation_count, result_count, latency_ms |
+| **HybridRetriever** | `hybrid_retrieve` | query, vector_weight, bm25_weight, top_k, rrf_k, result_count, vector_result_count, bm25_result_count, latency_ms |
+| **LLM Generator** | `llm_generate_answer` | query, doc_count, provider, latency_ms, answer_length, prompt_length |
+| **Zhipu LLM** | `zhipu_llm_generate` | model, prompt_length, latency_ms, response_length |
+| **Zhipu LLM Stream** | `zhipu_llm_stream` | model, prompt_length, chunk_count, total_length |
+
+**使用方式**:
+
+```go
+// 创建链路追踪 span
+span := observability.GlobalTracer.StartSpan(ctx, "operation_name", map[string]interface{}{
+    "query": query,
+    "top_k": topK,
+})
+defer span.End()
+
+// 添加元数据
+span.AddMetadata("result_count", len(results))
+span.AddMetadata("latency_ms", float64(latency))
+
+// 错误处理
+if err != nil {
+    span.SetError(err)
+    return err
+}
+```
+
+**子 Span**:
+
+对于复杂的操作，可以创建子 span 进行更细粒度的追踪：
+
+```go
+// 主 span
+span := observability.GlobalTracer.StartSpan(ctx, "vector_retrieve", ...)
+
+// 子 span (如: 调用 Embedding API)
+embeddingSpan := observability.GlobalTracer.StartSpan(ctx, "embedding_api", ...)
+// ... 执行操作 ...
+embeddingSpan.End()
+
+// 继续主操作
+// ...
+span.End()
+```
+
+#### 7.2 监控指标 (`metrics.go`)
+
+**职责**: 通过 Prometheus 收集系统运行指标。
+
+**指标类型**:
+
+```go
+// 计数器 (Counter)
+metrics.QueryCounter.Inc()
+
+// 直方图 (Histogram)
+metrics.QueryLatency.Observe(duration)
+
+// 仪表盘 (Gauge)
+metrics.ActiveQueries.Inc()
+defer metrics.ActiveQueries.Dec()
+```
+
+**导出的指标**:
+
+| 指标名称 | 类型 | 描述 |
+|---------|------|------|
+| `rag_queries_total` | Counter | 总查询次数 |
+| `rag_query_latency_ms` | Histogram | 查询延迟分布 |
+| `rag_active_queries` | Gauge | 当前活跃查询数 |
+| `rag_retrieval_errors_total` | Counter | 检索错误次数 |
+| `rag_llm_generation_duration_ms` | Histogram | LLM 生成耗时 |
 
 ---
 

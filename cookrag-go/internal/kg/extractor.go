@@ -287,15 +287,16 @@ func (e *RecipeExtractor) isIngredient(text string) bool {
 		return true
 	}
 
-	// 中文字符为主的行
+	// 判断是否是短中文实体（可能是食材名）
+	// 逻辑：超过50%的字符是汉字，且长度≤4（如"五花肉"、"土豆"）
 	chineseCount := 0
 	for _, r := range text {
-		if unicode.Is(unicode.Han, r) {
+		if unicode.Is(unicode.Han, r) { // 判断是否是汉字
 			chineseCount++
 		}
 	}
-	ratio := float64(chineseCount) / float64(len([]rune(text)))
-	return ratio > 0.5 && len([]rune(text)) <= 4
+	ratio := float64(chineseCount) / float64(len([]rune(text))) // 计算汉字比例
+	return ratio > 0.5 && len([]rune(text)) <= 4 // 汉字占一半以上且长度≤4，判定为食材
 }
 
 // extractDifficulty 提取难度

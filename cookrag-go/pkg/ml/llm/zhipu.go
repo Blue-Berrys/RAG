@@ -12,6 +12,7 @@ import (
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	"cookrag-go/internal/observability"
 )
 
 // ZhipuLLM 智谱AI LLM实现（使用 eino 框架）
@@ -54,6 +55,15 @@ func NewZhipuLLM(model string) (*ZhipuLLM, error) {
 
 // Generate 生成文本
 func (z *ZhipuLLM) Generate(ctx context.Context, prompt string) (string, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "zhipu_llm_generate", map[string]interface{}{
+		"model":         z.model,
+		"prompt_length": len(prompt),
+	})
+	defer span.End()
+
+	startTime := time.Now()
+
 	log.Infof("🤖 Zhipu LLM generation: model=%s", z.model)
 
 	// 将 prompt 转换为 eino 的 Message 格式
@@ -64,11 +74,20 @@ func (z *ZhipuLLM) Generate(ctx context.Context, prompt string) (string, error) 
 	// 调用 eino 生成
 	response, err := z.chatModel.Generate(ctx, messages)
 	if err != nil {
+		span.SetError(err)
 		return "", fmt.Errorf("generate failed: %w", err)
 	}
 
 	if response == nil {
-		return "", fmt.Errorf("no response returned")
+		err := fmt.Errorf("no response returned")
+		span.SetError(err)
+		return "", err
+	}
+
+	latency := float64(time.Since(startTime).Milliseconds())
+	span.AddMetadata("latency_ms", latency)
+	if response != nil && response.Content != "" {
+		span.AddMetadata("response_length", len(response.Content))
 	}
 
 	log.Infof("✅ Zhipu LLM generation completed")
@@ -77,6 +96,13 @@ func (z *ZhipuLLM) Generate(ctx context.Context, prompt string) (string, error) 
 
 // GenerateWithStream 流式生成
 func (z *ZhipuLLM) GenerateWithStream(ctx context.Context, prompt string) (<-chan string, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "zhipu_llm_stream", map[string]interface{}{
+		"model":         z.model,
+		"prompt_length": len(prompt),
+	})
+	defer span.End()
+
 	stream := make(chan string, 10)
 
 	// 将 prompt 转换为 eino 的 Message 格式
@@ -87,6 +113,7 @@ func (z *ZhipuLLM) GenerateWithStream(ctx context.Context, prompt string) (<-cha
 	// 调用 eino 流式生成
 	streamReader, err := z.chatModel.Stream(ctx, messages)
 	if err != nil {
+		span.SetError(err)
 		close(stream)
 		return stream, fmt.Errorf("stream generation failed: %w", err)
 	}
@@ -95,6 +122,9 @@ func (z *ZhipuLLM) GenerateWithStream(ctx context.Context, prompt string) (<-cha
 	go func() {
 		defer close(stream)
 		defer streamReader.Close()
+
+		chunkCount := 0
+		totalLength := 0
 
 		for {
 			chunk, err := streamReader.Recv()
@@ -108,8 +138,13 @@ func (z *ZhipuLLM) GenerateWithStream(ctx context.Context, prompt string) (<-cha
 
 			if chunk != nil && chunk.Content != "" {
 				stream <- chunk.Content
+				chunkCount++
+				totalLength += len(chunk.Content)
 			}
 		}
+
+		span.AddMetadata("chunk_count", chunkCount)
+		span.AddMetadata("total_length", totalLength)
 
 		log.Infof("✅ Stream generation completed")
 	}()

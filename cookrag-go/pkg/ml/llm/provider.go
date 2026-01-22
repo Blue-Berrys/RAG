@@ -3,9 +3,11 @@ package llm
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/charmbracelet/log"
 	"cookrag-go/internal/models"
+	"cookrag-go/internal/observability"
 )
 
 // Provider LLM提供者接口
@@ -28,6 +30,16 @@ func NewGenerator(provider Provider) *Generator {
 
 // GenerateAnswer 生成答案
 func (g *Generator) GenerateAnswer(ctx context.Context, query string, documents []models.Document) (string, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "llm_generate_answer", map[string]interface{}{
+		"query":          query,
+		"doc_count":      len(documents),
+		"provider":       "llm",
+	})
+	defer span.End()
+
+	startTime := time.Now()
+
 	log.Infof("🤖 Generating answer for query: %s", query)
 	log.Infof("📚 Using %d context documents", len(documents))
 
@@ -40,8 +52,14 @@ func (g *Generator) GenerateAnswer(ctx context.Context, query string, documents 
 	// 调用LLM生成
 	answer, err := g.provider.Generate(ctx, prompt)
 	if err != nil {
+		span.SetError(err)
 		return "", fmt.Errorf("LLM generation failed: %w", err)
 	}
+
+	latency := float64(time.Since(startTime).Milliseconds())
+	span.AddMetadata("latency_ms", latency)
+	span.AddMetadata("answer_length", len(answer))
+	span.AddMetadata("prompt_length", len(prompt))
 
 	log.Infof("✅ Answer generated successfully")
 	return answer, nil

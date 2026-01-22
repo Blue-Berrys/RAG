@@ -7,9 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/log"
 	"cookrag-go/internal/core/retrieval"
 	"cookrag-go/internal/models"
+	"cookrag-go/internal/observability"
+
+	"github.com/charmbracelet/log"
 )
 
 // QueryRouterConfig 路由器配置
@@ -62,6 +64,12 @@ func NewQueryRouter(
 
 // Route 智能路由
 func (r *QueryRouter) Route(ctx context.Context, query string) (*models.RetrievalResult, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "query_route", map[string]interface{}{
+		"query": query,
+	})
+	defer span.End()
+
 	startTime := time.Now()
 
 	log.Infof("🚦 Routing query: %s", query)
@@ -70,6 +78,11 @@ func (r *QueryRouter) Route(ctx context.Context, query string) (*models.Retrieva
 	analysis := r.analyzeQuery(query)
 	log.Infof("📊 Query analysis: complexity=%.2f, entities=%d, strategy=%s",
 		analysis.Complexity, analysis.RelationshipIntensity, analysis.RecommendedStrategy)
+
+	// 将分析结果添加到 span metadata
+	span.AddMetadata("complexity", analysis.Complexity)
+	span.AddMetadata("relationship_intensity", analysis.RelationshipIntensity)
+	span.AddMetadata("recommended_strategy", analysis.RecommendedStrategy)
 
 	// 根据分析结果路由到不同的检索器
 	var result *models.RetrievalResult
@@ -88,27 +101,24 @@ func (r *QueryRouter) Route(ctx context.Context, query string) (*models.Retrieva
 		log.Infof("🔍 Routing to Vector Retrieval")
 		result, err = r.vectorRetriever.Retrieve(ctx, query)
 
-	case "bm25":
-		log.Infof("📝 Routing to BM25 Retrieval")
-		docs, _ := r.bm25Retriever.Retrieve(ctx, query, 10)
-		result = &models.RetrievalResult{
-			Documents: docs,
-			Strategy:  "bm25",
-			Query:     query,
-		}
-
 	default:
 		log.Infof("🔀 Routing to Hybrid (default)")
 		result, err = r.hybridRetriever.Retrieve(ctx, query)
 	}
 
 	if err != nil {
+		span.SetError(err)
 		return nil, fmt.Errorf("retrieval failed: %w", err)
 	}
 
 	// 添加查询分析信息到结果
 	result.Query = query
 	result.Latency = float64(time.Since(startTime).Milliseconds())
+
+	// 将结果添加到 span metadata
+	span.AddMetadata("strategy", result.Strategy)
+	span.AddMetadata("result_count", len(result.Documents))
+	span.AddMetadata("latency_ms", result.Latency)
 
 	log.Infof("✅ Routing completed: strategy=%s, results=%d, latency=%.2fms",
 		result.Strategy, len(result.Documents), result.Latency)

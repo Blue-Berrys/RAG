@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"cookrag-go/internal/models"
+	"cookrag-go/internal/observability"
 	"github.com/yanyiwu/gojieba"
 )
 
@@ -129,7 +130,7 @@ func (r *BM25Retriever) IndexDocuments(ctx context.Context, documents []models.D
 	r.index.mu.Lock()
 	defer r.index.mu.Unlock()
 
-	totalLength := 0
+	totalLength := 0 // 累计所有文档的总词数（用于计算平均文档长度）
 
 	for _, doc := range documents {
 		docID := doc.ID
@@ -139,40 +140,47 @@ func (r *BM25Retriever) IndexDocuments(ctx context.Context, documents []models.D
 
 		// 分词
 		words := r.Tokenize(doc.Content)
-		docLength := len(words)
-		docIDInt := int64(r.index.TotalDocs)
+		docLength := len(words) // 当前文档的词数
+		docIDInt := int64(r.index.TotalDocs) // TotalDocs 当前值就是当前文档的ID（0, 1, 2...）
 		r.index.DocLengths[docIDInt] = docLength
-		totalLength += docLength
+		totalLength += docLength // 累加总词数：例：文档0有50词，文档1有30词 → totalLength=80
 
-		// 构建倒排索引
-		termFreq := make(map[string]int)
+		// 构建倒排索引（词 → 文档列表 的映射）
+		// 例：{"红烧": [0, 5, 12], "肉": [0, 5, 12, 23]} 表示这些词出现在哪些文档中
+		termFreq := make(map[string]int) // 统计当前文档中每个词的出现次数
 		for _, word := range words {
-			termFreq[word]++
+			termFreq[word]++ // 例：{"红烧": 2, "肉": 3, "怎么": 1, "做": 1}
 		}
 
-		// 更新倒排表
-		for term := range termFreq {
+		// 更新倒排表（记录每个词出现在哪些文档中）
+		for term := range termFreq { // 遍历当前文档中的每个唯一词
 			if _, exists := r.index.Postings[term]; !exists {
-				r.index.Postings[term] = make([]int64, 0)
+				r.index.Postings[term] = make([]int64, 0) // 初始化该词的文档列表
 			}
+			// 将当前文档ID添加到该词的倒排列表
+			// TotalDocs 作为计数器：处理文档0时是0，处理完后++变成1（下一个文档的ID）
 			r.index.Postings[term] = append(r.index.Postings[term], int64(r.index.TotalDocs))
 		}
 
-		r.index.TotalDocs++
+		r.index.TotalDocs++ // 处理完当前文档后递增，为下一个文档准备ID
 	}
 
-	// 计算平均文档长度
+	// 计算平均文档长度（BM25算法需要）
+	// totalLength: 所有文档的总词数（例：3000词）
+	// r.index.TotalDocs: 文档总数（例：10个文档）
+	// r.index.AvgDocLength: 平均每个文档的词数（例：3000/10=300词）
 	if r.index.TotalDocs > 0 {
 		r.index.AvgDocLength = float64(totalLength) / float64(r.index.TotalDocs)
 	}
 
-	// 计算文档频率
+	// 计算文档频率（DF: Document Frequency，即一个词出现在多少个文档中）
+	// 用于计算IDF（逆文档频率）：DF越小（词越稀有），IDF越大，权重越高
 	for term, postings := range r.index.Postings {
-		uniqueDocs := make(map[int64]bool)
+		uniqueDocs := make(map[int64]bool) // 用map去重（确保同一文档只计数一次）
 		for _, docID := range postings {
 			uniqueDocs[docID] = true
 		}
-		r.index.DocFreq[term] = len(uniqueDocs)
+		r.index.DocFreq[term] = len(uniqueDocs) // 例：Postings["红烧"]=[0,1,2] → DF=3
 	}
 
 	log.Infof("✅ BM25 indexing completed: %d docs, avg_len: %.2f, %d unique terms",
@@ -183,6 +191,13 @@ func (r *BM25Retriever) IndexDocuments(ctx context.Context, documents []models.D
 
 // Retrieve BM25检索
 func (r *BM25Retriever) Retrieve(ctx context.Context, query string, topK int) ([]models.Document, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "bm25_retrieve", map[string]interface{}{
+		"query": query,
+		"top_k": topK,
+	})
+	defer span.End()
+
 	startTime := time.Now()
 
 	// 分词
@@ -192,6 +207,7 @@ func (r *BM25Retriever) Retrieve(ctx context.Context, query string, topK int) ([
 	}
 
 	log.Infof("🔍 BM25 retrieval: query='%s', terms=%d, top_k=%d", query, len(queryTerms), topK)
+	span.AddMetadata("term_count", len(queryTerms))
 
 	r.index.mu.RLock()
 	defer r.index.mu.RUnlock()
@@ -199,25 +215,31 @@ func (r *BM25Retriever) Retrieve(ctx context.Context, query string, topK int) ([
 	// 计算每个文档的BM25分数
 	scores := make(map[int64]float64)
 
-	for _, term := range queryTerms {
-		postings, termExists := r.index.Postings[term]
+	for _, term := range queryTerms { // 遍历查询中的每个词（如：["红烧", "肉"]）
+		postings, termExists := r.index.Postings[term] // 获取包含该词的文档列表
 		if !termExists {
-			continue
+			continue // 词不在索引中，跳过
 		}
 
-		docFreq := r.index.DocFreq[term]
+		docFreq := r.index.DocFreq[term] // 该词的文档频率（出现在多少个文档中）
+		// 计算IDF（逆文档频率）：词越稀有，IDF越大
+		// 公式：log((总文档数 - 文档频率 + 0.5) / (文档频率 + 0.5))
 		idf := math.Log((float64(r.index.TotalDocs) - float64(docFreq) + 0.5) / (float64(docFreq) + 0.5))
 
 		// 计算每个文档的分数贡献
-		for _, docID := range postings {
-			docLength := r.index.DocLengths[docID]
+		for _, docID := range postings { // 遍历包含该词的所有文档
+			docLength := r.index.DocLengths[docID] // 该文档的词数
+			// 归一化因子：长文档会"惩罚"分数（避免长文档占优势）
+			// B=0.75: 如果文档长度是平均长度的2倍，因子越大，分数越低
 			normFactor := 1 - r.config.B + r.config.B*float64(docLength)/r.index.AvgDocLength
 
-			// 简化版：使用词频=1（实际应该统计词频）
+			// 简化版：使用词频=1（实际应该统计词在该文档中出现的次数）
 			tf := 1.0
+			// BM25核心公式：IDF × (TF × (K1 + 1)) / (TF + K1 × 归一化因子)
+			// K1=1.5: 控制词频饱和度（TF再大，分数也不会无限增长）
 			score := idf * (tf * (r.config.K1 + 1)) / (tf + r.config.K1*normFactor)
 
-			scores[docID] += score
+			scores[docID] += score // 累加该词对文档的分数贡献
 		}
 	}
 
@@ -246,6 +268,8 @@ func (r *BM25Retriever) Retrieve(ctx context.Context, query string, topK int) ([
 	}
 
 	latency := time.Since(startTime).Milliseconds()
+	span.AddMetadata("result_count", len(results))
+	span.AddMetadata("latency_ms", float64(latency))
 	log.Infof("✅ BM25 retrieval completed: %d results in %dms", len(results), latency)
 
 	return results, nil

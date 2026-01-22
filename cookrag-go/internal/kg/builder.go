@@ -134,25 +134,39 @@ func (b *GraphBuilder) BuildFromDocuments(ctx context.Context, documents []Docum
 }
 
 // createIndexes 创建索引
+// Neo4j 索引用途：加速节点属性查询（类似 MySQL 索引）
+// 例如：MATCH (n:Dish {name: '红烧肉'}) 会直接通过索引定位，而不是扫描所有节点
 func (b *GraphBuilder) createIndexes(ctx context.Context) {
 	log.Infof("🔧 Creating indexes...")
 
+	// 定义需要创建的索引（标签 + 属性）
 	indexes := []struct {
 		label    string
 		property string
 	}{
-		{"Dish", "name"},
-		{"Ingredient", "name"},
-		{"Category", "name"},
-		{"Cuisine", "name"},
-		{"Difficulty", "name"},
+		{"Dish", "name"},         // 菜品名称索引（加速按菜名查询）
+		{"Ingredient", "name"},  // 食材名称索引（加速按食材查询）
+		{"Category", "name"},    // 分类名称索引
+		{"Cuisine", "name"},     // 菜系名称索引
+		{"Difficulty", "name"},  // 难度名称索引
 	}
 
 	for _, idx := range indexes {
-		// Neo4j 索引创建（需要驱动支持）
-		// 这里是示意，实际实现取决于 neo4j.Client 的接口
-		log.Infof("   Creating index on :%s(%s)", idx.label, idx.property)
+		// Neo4j 5.x 索引创建语法
+		// CREATE INDEX IF NOT EXISTS FOR (n:Label) ON (n.property)
+		// IF NOT EXISTS: 索引已存在则跳过，避免报错
+		cypher := fmt.Sprintf("CREATE INDEX IF NOT EXISTS FOR (n:%s) ON (n.%s)", idx.label, idx.property)
+
+		_, err := b.neo4jClient.ExecuteWrite(ctx, cypher, nil)
+		if err != nil {
+			log.Warnf("⚠️  Failed to create index on :%s(%s): %v", idx.label, idx.property, err)
+			// 索引创建失败不中断流程，继续创建其他索引
+		} else {
+			log.Infof("   ✅ Created index on :%s(%s)", idx.label, idx.property)
+		}
 	}
+
+	log.Infof("✅ Index creation completed")
 }
 
 // Document 简化的文档结构

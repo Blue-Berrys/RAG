@@ -8,6 +8,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"cookrag-go/internal/models"
+	"cookrag-go/internal/observability"
 )
 
 // HybridRetrieverConfig 混合检索配置
@@ -56,6 +57,16 @@ func NewHybridRetriever(
 
 // Retrieve 混合检索
 func (r *HybridRetriever) Retrieve(ctx context.Context, query string) (*models.RetrievalResult, error) {
+	// 创建链路追踪 span
+	span := observability.GlobalTracer.StartSpan(ctx, "hybrid_retrieve", map[string]interface{}{
+		"query":         query,
+		"vector_weight": r.config.VectorWeight,
+		"bm25_weight":   r.config.BM25Weight,
+		"top_k":         r.config.TopK,
+		"rrf_k":         r.config.RRF,
+	})
+	defer span.End()
+
 	startTime := time.Now()
 
 	log.Infof("🔀 Hybrid retrieval: query='%s', vector_weight=%.2f, bm25_weight=%.2f",
@@ -91,10 +102,12 @@ func (r *HybridRetriever) Retrieve(ctx context.Context, query string) (*models.R
 	bm25Res := <-bm25ResultCh
 
 	if vectorRes.Error != nil {
+		span.SetError(vectorRes.Error)
 		return nil, fmt.Errorf("vector retrieval failed: %w", vectorRes.Error)
 	}
 
 	if bm25Res.Error != nil {
+		span.SetError(bm25Res.Error)
 		return nil, fmt.Errorf("BM25 retrieval failed: %w", bm25Res.Error)
 	}
 
@@ -116,6 +129,11 @@ func (r *HybridRetriever) Retrieve(ctx context.Context, query string) (*models.R
 		Latency:   float64(time.Since(startTime).Milliseconds()),
 	}
 
+	span.AddMetadata("result_count", len(fusedDocuments))
+	span.AddMetadata("vector_result_count", len(vectorRes.Result.Documents))
+	span.AddMetadata("bm25_result_count", len(bm25Res.Result.Documents))
+	span.AddMetadata("latency_ms", result.Latency)
+
 	log.Infof("✅ Hybrid retrieval completed: %d results in %.2fms",
 		len(fusedDocuments), result.Latency)
 
@@ -135,26 +153,31 @@ func (r *HybridRetriever) reciprocalRankFusion(
 
 	scores := make(map[string]*docScore)
 
-	// 处理向量检索结果
-	for rank, doc := range vectorDocs {
+	// 处理向量检索结果（RRF融合算法）
+	// RRF公式：score = weight × K / (K + rank)
+	// rank=0 → score最大，rank越大 → score越小（排名越靠后，分数越低）
+	for rank, doc := range vectorDocs { // rank: 0,1,2...（0是最高排名）
+		// 计算RRF分数：权重 × (K / (K + 排名 + 1))
+		// 例：K=60, rank=0 → 60/61 ≈ 0.98（最高分）
+		//     K=60, rank=9 → 60/70 ≈ 0.86
 		rrfScore := r.config.VectorWeight * float64(r.config.RRF) / float64(r.config.RRF+rank+1)
 
 		if existing, exists := scores[doc.ID]; exists {
-			existing.Score += rrfScore
+			existing.Score += rrfScore // 文档已存在，累加分数（同时出现在向量+BM25中）
 		} else {
-			scores[doc.ID] = &docScore{
+			scores[doc.ID] = &docScore{ // 文档不存在，创建新条目
 				Doc:   doc,
 				Score: rrfScore,
 			}
 		}
 	}
 
-	// 处理BM25检索结果
+	// 处理BM25检索结果（同样的RRF公式）
 	for rank, doc := range bm25Docs {
 		rrfScore := r.config.BM25Weight * float64(r.config.RRF) / float64(r.config.RRF+rank+1)
 
 		if existing, exists := scores[doc.ID]; exists {
-			existing.Score += rrfScore
+			existing.Score += rrfScore // 累加BM25分数
 		} else {
 			scores[doc.ID] = &docScore{
 				Doc:   doc,
@@ -241,10 +264,13 @@ func (r *HybridRetriever) QueryExpansion(ctx context.Context, query string) ([]s
 		return []string{query}, nil
 	}
 
-	// 生成查询变体
-	queries := []string{query} // 原始查询
+	// 生成查询变体（Query Expansion）：用多种方式表达同一查询，提高召回率
+	queries := []string{query} // 原始查询："红烧肉怎么做"
 
-	// 添加部分查询（用于召回增强）
+	// 添加部分查询（用于召回增强）：取相邻词对生成新查询
+	// 例：原查询="红烧肉怎么做" 分词=["红烧", "肉", "怎么", "做"]
+	// 生成变体："红烧肉", "肉怎么", "怎么做"
+	// 作用：如果文档中有"红烧肉"但没有完整句子，也能被召回
 	if len(terms) > 2 {
 		for i := 0; i < len(terms)-1; i++ {
 			partialQuery := fmt.Sprintf("%s %s", terms[i], terms[i+1])

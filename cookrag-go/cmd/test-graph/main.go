@@ -2,6 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/charmbracelet/log"
@@ -14,10 +18,40 @@ import (
 	"cookrag-go/pkg/storage/neo4j"
 )
 
-func main() {
+// initLoggingWithFile 初始化日志配置（同时输出到终端和文件）
+func initLoggingWithFile() (*os.File, error) {
 	log.SetLevel(log.InfoLevel)
 	log.SetReportTimestamp(true)
 	log.SetTimeFormat(time.Kitchen)
+
+	logDir := "logs"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	logFileName := fmt.Sprintf("test-graph-%s.log", time.Now().Format("2006-01-02"))
+	logFilePath := filepath.Join(logDir, logFileName)
+
+	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	log.SetOutput(multiWriter)
+
+	log.Infof("📝 Log file: %s", logFilePath)
+
+	return logFile, nil
+}
+
+func main() {
+	logFile, err := initLoggingWithFile()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logging: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
 
 	// 加载配置
 	cfg, _ := config.Load("config/config.yaml")
