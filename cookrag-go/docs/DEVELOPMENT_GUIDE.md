@@ -1019,6 +1019,72 @@ go run cmd/build-graph/main.go
    ```
 3. 重新运行 demo 或构建图谱
 
+### Q: 检索结果分数为 0 是怎么回事？
+
+**症状**: 混合检索返回的文档 `Score` 为 0.0000
+
+**原因**: 有多种可能原因：
+
+1. **Milvus 集合未正确加载**
+   - 插入数据后需要 `Flush` 然后 `LoadCollection`
+   - 否则数据在磁盘上，搜索不到
+
+2. **Redis 缓存中保存了旧数据**
+   - 清空 Redis: `redis-cli FLUSHALL`
+
+3. **Milvus 文档 ID 冲突**
+   - 如果使用简单索引（0, 1, 2...）可能导致 ID 重复
+   - 解决方案：使用唯一 ID（时间戳 + 索引）
+
+**解决方案**:
+
+1. **清空并重建 Milvus 集合**:
+   ```bash
+   go run scripts/cleanup-milvus.go
+   ```
+
+2. **清空 Redis 缓存**:
+   ```bash
+   redis-cli FLUSHALL
+   ```
+
+3. **重新运行 demo**:
+   ```bash
+   source .env && go run cmd/demo/main.go
+   ```
+
+**验证修复**: 检查日志中的 DEBUG 输出
+```
+🐛 DEBUG vector[0]: ID=doc_1769174444563, rrf_score=0.2951  ← 分数 > 0 即正常
+```
+
+### Q: RRF 分数为什么只有 0.295？不是应该是 0.7 吗？
+
+**原因**: 系统使用了**自适应权重**（AdaptiveRetrieval），根据查询复杂度动态调整：
+
+| 查询复杂度 | vector 权重 | bm25 权重 | 最高分数 |
+|-----------|------------|----------|---------|
+| 简单 (< 0.3) | 0.30 | 0.70 | ~0.295 |
+| 中等 (0.3-0.7) | 0.70 | 0.30 | ~0.688 |
+| 复杂 (> 0.7) | 0.80 | 0.20 | ~0.784 |
+
+**如果想要固定权重**（不自适应），修改 `router.go` 的 `recommendStrategy` 函数：
+
+```go
+func (r *QueryRouter) recommendStrategy(analysis *models.QueryAnalysis) string {
+    if r.config.EnableGraphRAG && analysis.RelationshipIntensity > 0.6 {
+        return "graph"
+    }
+
+    // 直接使用固定权重的 Hybrid，不使用 Adaptive
+    if r.config.EnableHybrid {
+        return "hybrid"  // vector=0.7, bm25=0.3
+    }
+
+    return "vector"
+}
+```
+
 ---
 
 ## 性能优化建议

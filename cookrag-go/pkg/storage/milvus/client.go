@@ -66,34 +66,57 @@ func (c *Client) HasCollection(ctx context.Context, collectionName string) (bool
 func (c *Client) CreateCollection(ctx context.Context, collectionName string, dimension int) error {
 	log.Printf("📦 Creating Milvus collection: %s (dimension: %d)", collectionName, dimension)
 
+	// Milvus Schema 定义（类似 MySQL 的表结构）
+	// Collection: 集合，相当于数据库中的表
+	// Field: 字段，定义集合中的列
+	// DataType: 数据类型（Int64/FloatVector/VarChar/JSON）
 	schema := &entity.Schema{
-		CollectionName: collectionName,
-		Description:    "CookRAG document collection",
-		AutoID:         false,
+		// 集合基本信息
+		CollectionName: collectionName,                // 集合名称（类似表名）
+		Description:    "CookRAG document collection", // 集合描述
+		AutoID:         false,                         // 不自动生成ID，使用文档ID作为主键
+
+		// 字段定义（类似表结构）
 		Fields: []*entity.Field{
+			// ========== 主键字段 ==========
 			{
-				Name:       "id",
-				DataType:   entity.FieldTypeInt64,
-				PrimaryKey: true,
-				AutoID:     false,
+				Name:       "id",                  // 字段名：文档ID
+				DataType:   entity.FieldTypeInt64, // 数据类型：64位整数
+				PrimaryKey: true,                  // 设置为主键（必须唯一）
+				AutoID:     false,                 // 不自动生成ID（手动指定）
 			},
+
+			// ========== 向量字段 ==========
+			// 存储 embedding 向量，用于语义相似度搜索
 			{
-				Name:     "vector",
-				DataType: entity.FieldTypeFloatVector,
+				Name:     "vector",                    // 字段名：向量数据
+				DataType: entity.FieldTypeFloatVector, // 数据类型：浮点数向量
 				TypeParams: map[string]string{
-					"dim": fmt.Sprintf("%d", dimension),
+					"dim": fmt.Sprintf("%d", dimension), // 向量维度（如1024）
 				},
 			},
+
+			// ========== 文本字段 ==========
+			// 存储原始文档内容（如整个菜谱的 Markdown 文本）
+			// 用途：检索后显示给用户、作为上下文传给 LLM
+			// 特点：非结构化长文本，人类可读
+			// 示例："# 红烧肉的做法\n红烧肉是一道经典的中国菜，主要食材是五花肉..."
 			{
-				Name:     "text",
-				DataType: entity.FieldTypeVarChar,
+				Name:     "text",                  // 字段名：原始文本
+				DataType: entity.FieldTypeVarChar, // 数据类型：可变长字符串
 				TypeParams: map[string]string{
-					"max_length": "65535",
+					"max_length": "65535", // 最大长度：65535字符
 				},
 			},
+
+			// ========== 元数据字段 ==========
+			// 存储文档的结构化属性信息（键值对形式）
+			// 用途：按分类筛选、显示菜名、难度等级等
+			// 特点：JSON 格式，机器可读的结构化数据
+			// 示例：{"file": "meat_dish/红烧肉.md", "category": "肉菜", "dish": "红烧肉", "difficulty": "★★★"}
 			{
-				Name:     "metadata",
-				DataType: entity.FieldTypeJSON,
+				Name:     "metadata",           // 字段名：元数据（JSON格式）
+				DataType: entity.FieldTypeJSON, // 数据类型：JSON对象
 			},
 		},
 	}
@@ -109,11 +132,19 @@ func (c *Client) CreateCollection(ctx context.Context, collectionName string, di
 // CreateIndex 创建索引
 func (c *Client) CreateIndex(ctx context.Context, collectionName, fieldName string, idxType string, params map[string]string) error {
 	log.Printf("📇 Creating index on %s.%s (type: %s)", collectionName, fieldName, idxType)
+	// fieldName 是指定要在哪个字段上创建索引
 
-	// 创建索引 - 使用IVF_FLAT
+	// Milvus 索引说明：
+	// 索引用于加速向量相似度搜索，没有索引的话就是暴力搜索（FLAT）
+	// IVF_FLAT: 基于倒排文件的索引，平衡速度和精度（推荐）
+	// HNSW: 基于图的索引，速度更快但内存占用更大
+	// L2: 欧几里得距离的平方（最常用）
+	// IP: 内积（Inner Product）
+	// COSINE: 余弦相似度
+	// nlist: 聚类中心点数量，影响检索速度和精度（通常设为 sqrt(数据量)）
 	idx, err := entity.NewIndexIvfFlat(
-		entity.L2, // metric type
-		128,      // nlist
+		entity.L2, // 距离度量类型：L2距离（欧几里得距离的平方）
+		128,       // nlist参数：聚类中心点数量，影响索引性能
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create index config: %w", err)
@@ -175,7 +206,17 @@ func (c *Client) Flush(ctx context.Context, collectionName string) error {
 	return c.client.Flush(ctx, collectionName, true)
 }
 
-// LoadCollection 加载集合
+// LoadCollection 加载集合到内存
+// Milvus 说明：
+// 1. 数据默认存储在磁盘上，搜索前必须先加载到内存
+// 2. LoadCollection 把集合的向量数据从磁盘加载到 Milvus 服务器端的内存中
+// 3. 参数 false = 只加载到内存（CPU），true = 加载到 GPU 内存（需要 GPU 支持）
+// 4. 没有返回值：这是异步操作，只是触发加载过程，实际加载在后台进行
+// 5. 必须在搜索前调用，否则搜索会报错或返回空结果
+//
+// 数据流向：磁盘（持久化存储） → 内存（快速访问） → 搜索时直接读取
+//
+// 类比：就像看书前要先从书架把书拿到桌子上，才能快速翻阅
 func (c *Client) LoadCollection(ctx context.Context, collectionName string) error {
 	log.Printf("⏳ Loading collection: %s", collectionName)
 
@@ -198,22 +239,38 @@ func (c *Client) Search(ctx context.Context, collectionName string, vectors [][]
 	}
 
 	// 执行搜索
-	sp, err := entity.NewIndexIvfFlatSearchParam(10) // nprobe
+	// nprobe 参数说明：
+	// IVF_FLAT 索引把向量空间分成多个聚类（nlist=128 表示分成 128 个聚类）
+	// nprobe 指定搜索时检查多少个聚类（值越大，搜索越精确，但速度越慢）
+	//
+	// 权衡关系：
+	// nprobe = 1   → 最快，精度最低（只搜索 1 个聚类）
+	// nprobe = 10  → 平衡（搜索最近的 10 个聚类）
+	// nprobe = 128 → 最慢，精度最高（搜索所有聚类，等同于暴力搜索）
+	//
+	// 经验值：nprobe 通常设为 nlist 的 1/10 到 1/2
+	// 这里 nlist=128, nprobe=10，比较合理
+	sp, err := entity.NewIndexIvfFlatSearchParam(10) // nprobe: 搜索聚类数量
 	if err != nil {
 		return nil, fmt.Errorf("failed to create search param: %w", err)
 	}
 
 	searchResult, err := c.client.Search(
 		ctx,
-		collectionName,
-		[]string{}, // partitions
-		"",         // expr
-		outputFields,
-		vectorsData,
-		vectorField,
-		entity.L2, // metric type
-		topK,
-		sp, // search param
+		collectionName,          // 集合名称
+		[]string{},              // partitions: 指定搜索哪些分区（空数组=搜索所有分区）
+		                        // 分区示例：[]string{"川菜", "湘菜"} 只搜索这些分区
+		                        // 常见用法：[]string{} 搜索全部
+		"",                      // expr: 标量过滤表达式（类似 SQL 的 WHERE 子句）
+		                        // 示例："metadata[\"difficulty\"] == \"简单\"" 只查简单菜谱
+		                        // 示例："metadata[\"category\"] == \"川菜\"" 只查川菜
+		                        // 常见用法："" 不过滤，搜索全部数据
+		outputFields,             // 输出哪些字段（如 ["text", "metadata"]）
+		vectorsData,              // 搜索向量（用户查询的 embedding）
+		vectorField,              // 在哪个字段上搜索（通常是 "vector"）
+		entity.L2,                // metric type: 距离度量类型（L2/IP/COSINE）
+		topK,                     // 返回最相似的 K 个结果
+		sp,                       // search param: 搜索参数（如 nprobe=10）
 	)
 
 	if err != nil {

@@ -2,6 +2,7 @@ package retrieval
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"time"
 
@@ -75,7 +76,23 @@ func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.R
 
 	startTime := time.Now()
 
-	// 1. 生成查询向量（创建子 span）
+	// 1. 先检查缓存（在Embedding之前，避免不必要的token消耗）
+	if r.config.UseCache && r.cache != nil {
+		cacheKey := r.getCacheKey(query)
+		var cachedResult models.RetrievalResult
+		cacheCheckStart := time.Now()
+		if err := r.cache.Get(ctx, cacheKey, &cachedResult); err == nil {
+			// 缓存命中，直接返回（跳过Embedding和Milvus查询）
+			span.AddMetadata("cache_hit", true)
+			span.AddMetadata("cache_latency_ms", float64(time.Since(cacheCheckStart).Milliseconds()))
+			log.Infof("💨 Cache hit for query: %s (skipped Embedding)", query)
+			cachedResult.Latency = float64(time.Since(startTime).Milliseconds())
+			return &cachedResult, nil
+		}
+		span.AddMetadata("cache_hit", false)
+	}
+
+	// 2. 生成查询向量（缓存未命中时才执行）
 	log.Infof("🔤 Embedding query: %s", query)
 	embeddingSpan := observability.GlobalTracer.StartSpan(ctx, "embedding_api", map[string]interface{}{
 		"query": query,
@@ -90,22 +107,6 @@ func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.R
 		return nil, fmt.Errorf("failed to embed query: %w", err)
 	}
 	embeddingSpan.End()
-
-	// 2. 检查缓存
-	if r.config.UseCache && r.cache != nil {
-		cacheKey := r.getCacheKey(query)
-		var cachedResult models.RetrievalResult
-		cacheCheckStart := time.Now()
-		if err := r.cache.Get(ctx, cacheKey, &cachedResult); err == nil {
-			cacheHit := true
-			span.AddMetadata("cache_hit", cacheHit)
-			span.AddMetadata("cache_latency_ms", float64(time.Since(cacheCheckStart).Milliseconds()))
-			log.Infof("💨 Cache hit for query: %s", query)
-			cachedResult.Latency = float64(time.Since(startTime).Milliseconds())
-			return &cachedResult, nil
-		}
-		span.AddMetadata("cache_hit", false)
-	}
 
 	// 3. 执行向量搜索（创建子 span）
 	log.Infof("🔍 Searching in Milvus collection: %s", r.config.CollectionName)
@@ -134,15 +135,31 @@ func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.R
 	// 4. 转换结果
 	documents := make([]models.Document, 0, len(searchResults))
 	for _, result := range searchResults {
+		// 提取文本（用于生成唯一 ID 的降级方案）
+		var textContent string
+		if text, ok := result.Fields[r.config.TextField].(string); ok {
+			textContent = text
+		}
+
+		// 生成唯一 ID
+		var docID string
+		if result.ID != 0 {
+			// 正常情况：使用 Milvus 返回的 ID
+			docID = fmt.Sprintf("doc_%d", result.ID)
+		} else {
+			// 降级方案：使用内容哈希作为 ID（处理旧数据）
+			hash := md5.Sum([]byte(textContent))
+			docID = fmt.Sprintf("doc_%x", hash[:8])
+			log.Warnf("⚠️  Milvus returned ID=0, using content hash as ID: %s", docID)
+		}
+
 		doc := models.Document{
-			ID:    fmt.Sprintf("doc_%d", result.ID),
+			ID:    docID,
 			Score: result.Score,
 		}
 
 		// 提取文本和元数据
-		if text, ok := result.Fields[r.config.TextField].(string); ok {
-			doc.Content = text
-		}
+		doc.Content = textContent
 
 		if metadata, ok := result.Fields[r.config.MetadataField].(map[string]interface{}); ok {
 			doc.Metadata = metadata
@@ -158,7 +175,7 @@ func (r *VectorRetriever) Retrieve(ctx context.Context, query string) (*models.R
 		Latency:   float64(time.Since(startTime).Milliseconds()),
 	}
 
-	// 5. 缓存结果
+	// 4. 缓存结果
 	if r.config.UseCache && r.cache != nil {
 		cacheKey := r.getCacheKey(query)
 		if err := r.cache.Set(ctx, cacheKey, result, r.config.CacheTTL); err != nil {
@@ -264,10 +281,15 @@ func (r *VectorRetriever) IndexDocuments(ctx context.Context, documents []models
 	ids := make([]int64, len(documents))
 	metadataList := make([]map[string]interface{}, len(documents))
 
+	// 使用时间戳 + 索引确保 ID 唯一
+	// 例: 1737585600123 * 1000 + 0 = 1737585600123000
+	baseTimestamp := time.Now().UnixNano() / 1000000 // 毫秒级时间戳
 	for i, doc := range documents {
-		ids[i] = int64(i)
+		ids[i] = baseTimestamp + int64(i)
 		metadataList[i] = doc.Metadata
 	}
+
+	log.Infof("📝 Generated unique IDs: base=%d, count=%d", baseTimestamp, len(ids))
 
 	// 批量插入
 	err = r.milvusClient.Insert(
@@ -283,10 +305,19 @@ func (r *VectorRetriever) IndexDocuments(ctx context.Context, documents []models
 		return fmt.Errorf("failed to insert documents: %w", err)
 	}
 
-	// 刷新集合
+	// 刷新集合（将数据持久化到磁盘）
 	if err := r.milvusClient.Flush(ctx, r.config.CollectionName); err != nil {
 		return fmt.Errorf("failed to flush collection: %w", err)
 	}
+
+	log.Infof("✅ Flushed collection to disk")
+
+	// Flush 后需要重新加载集合到内存（否则搜索不到数据）
+	if err := r.milvusClient.LoadCollection(ctx, r.config.CollectionName); err != nil {
+		return fmt.Errorf("failed to reload collection: %w", err)
+	}
+
+	log.Infof("✅ Reloaded collection into memory")
 
 	log.Infof("✅ Indexed %d documents successfully", len(documents))
 	return nil

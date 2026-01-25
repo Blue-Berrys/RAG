@@ -9,13 +9,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/charmbracelet/log"
 	"cookrag-go/internal/api/handlers"
+	"cookrag-go/internal/core/router"
 )
 
 // Server HTTP服务器
 type Server struct {
-	router      *gin.Engine
-	httpServer  *http.Server
-	port        int
+	router       *gin.Engine
+	httpServer   *http.Server
+	port         int
+	queryRouter  *router.QueryRouter
+	llmProvider  any // LLM provider (can be nil initially)
 	queryHandler *handlers.QueryHandler
 }
 
@@ -38,7 +41,7 @@ func DefaultConfig() *Config {
 }
 
 // NewServer 创建HTTP服务器
-func NewServer(config *Config) *Server {
+func NewServer(config *Config, queryRouter *router.QueryRouter, llmProvider any) *Server {
 	if config == nil {
 		config = DefaultConfig()
 	}
@@ -51,10 +54,15 @@ func NewServer(config *Config) *Server {
 	router.Use(loggerMiddleware())
 	router.Use(corsMiddleware())
 
+	// 创建查询处理器（传入路由器）
+	queryHandler := handlers.NewQueryHandler(queryRouter, llmProvider)
+
 	return &Server{
-		router:      router,
-		port:        config.Port,
-		queryHandler: handlers.NewQueryHandler(),
+		router:       router,
+		port:         config.Port,
+		queryRouter:  queryRouter,
+		llmProvider:  llmProvider,
+		queryHandler: queryHandler,
 		httpServer: &http.Server{
 			Addr:           fmt.Sprintf(":%d", config.Port),
 			Handler:        router,

@@ -5,18 +5,22 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/charmbracelet/log"
+	"cookrag-go/internal/core/router"
 	"cookrag-go/internal/models"
 )
 
 // QueryHandler 查询处理器
 type QueryHandler struct {
-	// 这里应该注入路由器等核心组件
-	// router *router.QueryRouter
+	router *router.QueryRouter
+	llm    any // LLM provider for answer generation (can be nil)
 }
 
 // NewQueryHandler 创建查询处理器
-func NewQueryHandler() *QueryHandler {
-	return &QueryHandler{}
+func NewQueryHandler(r *router.QueryRouter, llm any) *QueryHandler {
+	return &QueryHandler{
+		router: r,
+		llm:    llm,
+	}
 }
 
 // QueryRequest 查询请求
@@ -26,11 +30,10 @@ type QueryRequest struct {
 
 // QueryResponse 查询响应
 type QueryResponse struct {
-	Answer    string                `json:"answer"`
-	Documents []models.Document     `json:"documents"`
-	Strategy  string                `json:"strategy"`
-	Latency   float64               `json:"latency_ms"`
-	Analysis  *models.QueryAnalysis `json:"analysis,omitempty"`
+	Answer    string            `json:"answer"`
+	Documents []models.Document `json:"documents"`
+	Strategy  string            `json:"strategy"`
+	Latency   float64           `json:"latency_ms"`
 }
 
 // HandleQuery 处理查询请求
@@ -46,15 +49,23 @@ func (h *QueryHandler) HandleQuery(c *gin.Context) {
 
 	log.Infof("📥 Received query: %s", req.Query)
 
-	// TODO: 实际实现应该调用路由器
-	// result, err := h.router.Route(c.Request.Context(), req.Query)
+	// 调用路由器进行检索
+	result, err := h.router.Route(c.Request.Context(), req.Query)
+	if err != nil {
+		log.Errorf("❌ Query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Query processing failed",
+			"details": err.Error(),
+		})
+		return
+	}
 
-	// 临时响应
+	// 构建响应
 	response := QueryResponse{
-		Answer: "这是查询结果：" + req.Query,
-		Documents: []models.Document{},
-		Strategy: "hybrid",
-		Latency:  100.0,
+		Answer:    "", // LLM生成的答案将在后续添加
+		Documents: result.Documents,
+		Strategy:  result.Strategy,
+		Latency:   result.Latency,
 	}
 
 	c.JSON(http.StatusOK, response)

@@ -101,9 +101,11 @@ func (r *HybridRetriever) Retrieve(ctx context.Context, query string) (*models.R
 	vectorRes := <-vectorResultCh
 	bm25Res := <-bm25ResultCh
 
+	// 优雅降级：如果vector检索失败，只使用BM25结果
 	if vectorRes.Error != nil {
-		span.SetError(vectorRes.Error)
-		return nil, fmt.Errorf("vector retrieval failed: %w", vectorRes.Error)
+		log.Warnf("⚠️  Vector retrieval failed, using BM25 only: %v", vectorRes.Error)
+		span.AddMetadata("vector_fallback", true)
+		// 继续使用BM25结果
 	}
 
 	if bm25Res.Error != nil {
@@ -111,11 +113,18 @@ func (r *HybridRetriever) Retrieve(ctx context.Context, query string) (*models.R
 		return nil, fmt.Errorf("BM25 retrieval failed: %w", bm25Res.Error)
 	}
 
-	// RRF融合
-	fusedDocuments := r.reciprocalRankFusion(
-		vectorRes.Result.Documents,
-		bm25Res.Result.Documents,
-	)
+	// RRF融合（如果vector失败，只使用BM25结果）
+	var fusedDocuments []models.Document
+	if vectorRes.Error != nil {
+		// 只使用BM25结果
+		fusedDocuments = bm25Res.Result.Documents
+	} else {
+		// 正常RRF融合
+		fusedDocuments = r.reciprocalRankFusion(
+			vectorRes.Result.Documents,
+			bm25Res.Result.Documents,
+		)
+	}
 
 	// 截取top-k
 	if len(fusedDocuments) > r.config.TopK {
@@ -130,7 +139,9 @@ func (r *HybridRetriever) Retrieve(ctx context.Context, query string) (*models.R
 	}
 
 	span.AddMetadata("result_count", len(fusedDocuments))
-	span.AddMetadata("vector_result_count", len(vectorRes.Result.Documents))
+	if vectorRes.Result != nil {
+		span.AddMetadata("vector_result_count", len(vectorRes.Result.Documents))
+	}
 	span.AddMetadata("bm25_result_count", len(bm25Res.Result.Documents))
 	span.AddMetadata("latency_ms", result.Latency)
 
@@ -153,6 +164,8 @@ func (r *HybridRetriever) reciprocalRankFusion(
 
 	scores := make(map[string]*docScore)
 
+	log.Infof("🐛 DEBUG: Processing %d vector docs", len(vectorDocs))
+
 	// 处理向量检索结果（RRF融合算法）
 	// RRF公式：score = weight × K / (K + rank)
 	// rank=0 → score最大，rank越大 → score越小（排名越靠后，分数越低）
@@ -161,6 +174,11 @@ func (r *HybridRetriever) reciprocalRankFusion(
 		// 例：K=60, rank=0 → 60/61 ≈ 0.98（最高分）
 		//     K=60, rank=9 → 60/70 ≈ 0.86
 		rrfScore := r.config.VectorWeight * float64(r.config.RRF) / float64(r.config.RRF+rank+1)
+
+		// 调试日志：打印文档 ID 和分数
+		if rank < 3 { // 只打印前3个
+			log.Infof("🐛 DEBUG vector[%d]: ID=%s, rrf_score=%.4f", rank, doc.ID, rrfScore)
+		}
 
 		if existing, exists := scores[doc.ID]; exists {
 			existing.Score += rrfScore // 文档已存在，累加分数（同时出现在向量+BM25中）
@@ -240,6 +258,7 @@ func (r *HybridRetriever) AdaptiveRetrieval(
 		BM25Weight:   bm25Weight,
 		TopK:         r.config.TopK,
 		RRFK:         r.config.RRF,
+		RRF:          r.config.RRF, // 修复：必须同时设置 RRF
 	}
 
 	// 使用自适应配置创建临时检索器
